@@ -135,6 +135,22 @@ async def deliver_to_pending(bot: Bot, gossip_id: int, text: str, author_id: int
             return
 
 
+async def notify_admin_new_gossip(bot: Bot, gossip_id: int, user, text: str) -> None:
+    """Каждая новая сплетня сразу приходит админу (без команд), с номером автора для модерации."""
+    if not ADMIN_ID or user.id == ADMIN_ID:
+        return
+    try:
+        sent = await bot.send_message(ADMIN_ID, f"🤫 №{gossip_id}\n\n{text}")
+        uname = f"@{user.username}" if user.username else "без юзернейма"
+        await bot.send_message(
+            ADMIN_ID,
+            f"Автор: {user.id} ({uname})\n/del {gossip_id}   /ban {user.id}",
+            reply_to_message_id=sent.message_id,
+        )
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+
+
 # --------------------------------------------------------------------------
 # Хендлеры
 # --------------------------------------------------------------------------
@@ -239,6 +255,9 @@ async def on_gossip(message: Message, bot: Bot):
     )
     gossip_id = cur.lastrowid
     db.commit()
+
+    # Копия сплетни админу
+    await notify_admin_new_gossip(bot, gossip_id, message.from_user, text)
 
     # Новую сплетню сразу отдаём тому, кто ждёт
     await deliver_to_pending(bot, gossip_id, text, user_id)
