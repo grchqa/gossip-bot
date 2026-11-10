@@ -34,6 +34,7 @@
   /code [N]      - создать N одноразовых кодов для грязного раздела (по умолчанию 1, максимум 20)
   /codes         - неиспользованные коды и кто использовал последние
   /revoke <id>   - забрать у человека доступ к грязному разделу
+  /broadcast <текст> - отправить сообщение всем пользователям
   /last [N]      - последние N сплетен (по умолчанию 10, максимум 30)
   /reported [N]  - сплетни с голосами «Не согласен» (по умолчанию 10, максимум 20)
   /del <номер>   - удалить сплетню у всех
@@ -618,6 +619,25 @@ async def cmd_revoke(message: Message):
     await message.answer(f"Доступ к грязному разделу у {uid} закрыт.")
 
 
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message, bot: Bot):
+    """Отправить сообщение всем пользователям: /broadcast Текст сообщения"""
+    if not is_admin(message.from_user.id):
+        return
+    text = (message.text or "").partition(" ")[2].strip()
+    if not text:
+        await message.answer("Формат: /broadcast <текст сообщения>")
+        return
+    users = db.execute("SELECT user_id FROM users WHERE banned = 0").fetchall()
+    await message.answer(f"Начинаю рассылку: {len(users)} человек...")
+    ok = 0
+    for u in users:
+        if await send_text(bot, u["user_id"], text):
+            ok += 1
+        await asyncio.sleep(0.05)  # не превышаем лимит Telegram (около 30 сообщений в секунду)
+    await message.answer(f"Рассылка завершена: доставлено {ok} из {len(users)}.")
+
+
 @dp.message(Command("ban"))
 async def cmd_ban(message: Message, bot: Bot):
     if not is_admin(message.from_user.id):
@@ -1012,6 +1032,7 @@ async def setup_menu(bot: Bot) -> None:
             BotCommand(command="last", description="📋 Последние сплетни"),
             BotCommand(command="reported", description="⚠️ Сплетни с «не согласен»"),
             BotCommand(command="stats", description="📊 Статистика"),
+            BotCommand(command="broadcast", description="📣 Рассылка всем"),
         ]
         try:
             await bot.set_my_commands(admin, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
