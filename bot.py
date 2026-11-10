@@ -216,6 +216,52 @@ async def cmd_del(message: Message):
     await message.answer(f"Сплетня №{parts[1]} скрыта.")
 
 
+@dp.message(Command("last"))
+async def cmd_last(message: Message):
+    """Показать последние сплетни: /last (10 штук) или /last 25 (не больше 30)."""
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split()
+    n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10
+    n = max(1, min(n, 30))
+
+    rows = db.execute(
+        """
+        SELECT g.id, g.author_id, g.text, g.created_at, g.hidden,
+               (SELECT COUNT(*) FROM reports r WHERE r.gossip_id = g.id) AS rep
+        FROM gossips g ORDER BY g.id DESC LIMIT ?
+        """,
+        (n,),
+    ).fetchall()
+    if not rows:
+        await message.answer("Сплетен пока нет.")
+        return
+
+    blocks = []
+    for r in reversed(rows):  # старые сверху, самые новые внизу
+        when = datetime.fromisoformat(r["created_at"]).strftime("%d.%m %H:%M")
+        flags = ""
+        if r["hidden"]:
+            flags += " [СКРЫТА]"
+        if r["rep"]:
+            flags += f" [жалоб: {r['rep']}]"
+        text = r["text"] if len(r["text"]) <= 1500 else r["text"][:1500] + "… (обрезано)"
+        blocks.append(
+            f"№{r['id']} · {when} · автор {r['author_id']}{flags}\n{text}\n"
+            f"/del {r['id']}   /ban {r['author_id']}"
+        )
+
+    # Отправляем порциями, чтобы не упереться в лимит Телеграма
+    buf = ""
+    for block in blocks:
+        if buf and len(buf) + len(block) + 2 > 3800:
+            await message.answer(buf)
+            buf = ""
+        buf = f"{buf}\n\n{block}" if buf else block
+    if buf:
+        await message.answer(buf)
+
+
 @dp.message(Command("stats"))
 async def cmd_stats(message: Message):
     if not ADMIN_ID or message.from_user.id != ADMIN_ID:
