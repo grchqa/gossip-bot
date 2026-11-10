@@ -60,10 +60,13 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
+    BotCommand,
+    BotCommandScopeChat,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    MenuButtonCommands,
     Message,
     ReplyKeyboardMarkup,
 )
@@ -792,6 +795,7 @@ async def cmd_id(message: Message):
 
 
 # ----- переключение разделов -----------------------------------------------
+@dp.message(Command("normal"))
 @dp.message(F.text == BTN_NORMAL)
 async def on_btn_normal(message: Message):
     ensure_user(message.from_user)
@@ -801,6 +805,7 @@ async def on_btn_normal(message: Message):
     await message.answer(section_hint(NORMAL), reply_markup=main_keyboard())
 
 
+@dp.message(Command("dirty"))
 @dp.message(F.text == BTN_DIRTY)
 async def on_btn_dirty(message: Message):
     ensure_user(message.from_user)
@@ -987,11 +992,39 @@ async def fallback(message: Message):
 
 
 # --------------------------------------------------------------------------
+async def setup_menu(bot: Bot) -> None:
+    """Кнопка «Меню» слева от поля ввода: выбор раздела и остальные команды."""
+    public = [
+        BotCommand(command="normal", description=BTN_NORMAL),
+        BotCommand(command="dirty", description=BTN_DIRTY),
+        BotCommand(command="daily", description="🔔 Сплетня дня: вкл/выкл"),
+        BotCommand(command="start", description="🏠 Начало"),
+    ]
+    try:
+        await bot.set_my_commands(public)
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception:
+        logging.exception("Не удалось настроить меню")
+    if ADMIN_ID:
+        admin = public + [
+            BotCommand(command="code", description="🔑 Создать одноразовый код"),
+            BotCommand(command="codes", description="🔑 Список кодов"),
+            BotCommand(command="last", description="📋 Последние сплетни"),
+            BotCommand(command="reported", description="⚠️ Сплетни с «не согласен»"),
+            BotCommand(command="stats", description="📊 Статистика"),
+        ]
+        try:
+            await bot.set_my_commands(admin, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+        except Exception:
+            logging.warning("Админское меню не настроено (админ ещё не писал боту?)")
+
+
 async def main():
     if not BOT_TOKEN:
         raise SystemExit("Не задан BOT_TOKEN. Добавьте токен в переменные окружения.")
     logging.basicConfig(level=logging.INFO)
     bot = Bot(BOT_TOKEN)
+    await setup_menu(bot)
     daily_task = asyncio.create_task(daily_loop(bot))
     try:
         await dp.start_polling(bot)
