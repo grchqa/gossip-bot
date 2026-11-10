@@ -11,11 +11,13 @@
 import asyncio
 import logging
 import os
+import random
+import re
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
@@ -25,7 +27,9 @@ DB_PATH = os.getenv("DB_PATH", "gossip.db")
 
 MIN_LEN = 5          # минимальная длина сплетни
 MAX_LEN = 4000       # максимальная длина (Телеграм не пропускает больше 4096 в одном сообщении)
-DAILY_LIMIT = 10     # сколько сплетен в сутки можно отправить (защита от спама)
+DAILY_LIMIT = 10000  # лимит сплетен в сутки на человека (10000 = практически без ограничений)
+BROADCAST_EVERY = 10        # после скольких новых сплетен оповещать всех пользователей
+BROADCAST_COOLDOWN_MIN = 30  # не чаще, чем раз в N минут (0 = без паузы, но это быстро надоест людям)
 HIDE_AFTER = 3       # после скольки жалоб сплетня скрывается
 
 # --------------------------------------------------------------------------
@@ -39,7 +43,8 @@ db.executescript(
         user_id INTEGER PRIMARY KEY,
         username TEXT,
         banned INTEGER DEFAULT 0,
-        created_at TEXT
+        created_at TEXT,
+        notify INTEGER DEFAULT 1
     );
     CREATE TABLE IF NOT EXISTS gossips (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -58,12 +63,20 @@ db.executescript(
         reporter_id INTEGER,
         PRIMARY KEY (gossip_id, reporter_id)
     );
+    CREATE TABLE IF NOT EXISTS meta (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    );
     CREATE TABLE IF NOT EXISTS pending (
         user_id INTEGER PRIMARY KEY,
         created_at TEXT
     );
     """
 )
+# Если база осталась от старой версии бота, добавляем новый столбец
+_cols = {r["name"] for r in db.execute("PRAGMA table_info(users)")}
+if "notify" not in _cols:
+    db.execute("ALTER TABLE users ADD COLUMN notify INTEGER DEFAULT 1")
 db.commit()
 
 
@@ -149,6 +162,88 @@ async def notify_admin_new_gossip(bot: Bot, gossip_id: int, user, text: str) -> 
         )
     except (TelegramForbiddenError, TelegramBadRequest):
         pass
+
+
+BROADCAST_TEXTS = [
+    "🤫 В Сплетнице пополнились сплетни! Скорее отправляй свою, чтобы узнать всё 😏",
+    "😏 Тут накопились свежие сплетни. Напиши свою и получи чужую!",
+    "🤭 В Сплетнице новые истории. Отправляй свою сплетню и читай чужие 😏",
+]
+BROADCAST_SUFFIX = "\n\nОтключить такие уведомления: /notify"
+
+_broadcast_running = False
+_bg_tasks: set = set()
+
+
+def meta_get(key: str, default=None):
+    row = db.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def meta_set(key: str, value: str) -> None:
+    db.execute("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", (key, value))
+    db.commit()
+
+
+async def _send_with_retry(bot: Bot, uid: int, text: str) -> None:
+    for attempt in range(2):
+        try:
+            await bot.send_message(uid, text)
+            return
+        except TelegramRetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+        except TelegramForbiddenError:
+            # Человек заблокировал бота: больше не беспокоим
+            db.execute("UPDATE users SET notify = 0 WHERE user_id = ?", (uid,))
+            db.commit()
+            return
+        except TelegramBadRequest:
+            return
+
+
+async def _do_broadcast(bot: Bot) -> None:
+    global _broadcast_running
+    try:
+        rows = db.execute("SELECT user_id FROM users WHERE banned = 0 AND notify = 1").fetchall()
+        for row in rows:
+            await _send_with_retry(bot, row["user_id"], random.choice(BROADCAST_TEXTS) + BROADCAST_SUFFIX)
+            await asyncio.sleep(0.05)  # не превышаем лимит Telegram (около 30 сообщений в секунду)
+    except Exception:
+        logging.exception("Ошибка рассылки")
+    finally:
+        _broadcast_running = False
+
+
+async def maybe_broadcast(bot: Bot) -> None:
+    """Если набралось BROADCAST_EVERY новых сплетен, оповещаем всех пользователей."""
+    global _broadcast_running
+    if _broadcast_running:
+        return
+    last_id = int(meta_get("bc_id", "0"))
+    fresh = db.execute(
+        "SELECT COUNT(*) FROM gossips WHERE id > ? AND hidden = 0", (last_id,)
+    ).fetchone()[0]
+    if fresh < BROADCAST_EVERY:
+        return
+    last_at = meta_get("bc_at")
+    if last_at and BROADCAST_COOLDOWN_MIN > 0:
+        if datetime.now() - datetime.fromisoformat(last_at) < timedelta(minutes=BROADCAST_COOLDOWN_MIN):
+            return
+    newest = db.execute("SELECT MAX(id) FROM gossips").fetchone()[0]
+    meta_set("bc_id", str(newest))
+    meta_set("bc_at", datetime.now().isoformat())
+    _broadcast_running = True
+    task = asyncio.create_task(_do_broadcast(bot))
+    _bg_tasks.add(task)  # держим ссылку, чтобы задачу не убрала сборка мусора
+    task.add_done_callback(_bg_tasks.discard)
+
+
+def is_just_the_word_gossip(text: str) -> bool:
+    """True, если сообщение состоит только из слова «сплетня» в любой форме
+    (сплетня, сплетни, сплетню, сплетней, сплетница...), возможно с знаками и смайлами."""
+    cleaned = re.sub(r"[^\w\s]", " ", text.lower().replace("ё", "е"))
+    words = cleaned.split()
+    return bool(words) and all(w.startswith("сплетн") for w in words)
 
 
 # --------------------------------------------------------------------------
@@ -272,6 +367,21 @@ async def cmd_stats(message: Message):
     await message.answer(f"Пользователей: {users}\nСплетен: {gossips}\nСкрыто: {hidden}")
 
 
+@dp.message(Command("notify"))
+async def cmd_notify(message: Message):
+    """Включить или выключить уведомления «в Сплетнице новые сплетни»."""
+    ensure_user(message.from_user)
+    row = db.execute("SELECT notify FROM users WHERE user_id = ?", (message.from_user.id,)).fetchone()
+    if row["notify"]:
+        db.execute("UPDATE users SET notify = 0 WHERE user_id = ?", (message.from_user.id,))
+        db.commit()
+        await message.answer("🔕 Уведомления о новых сплетнях выключены. Включить: /notify")
+    else:
+        db.execute("UPDATE users SET notify = 1 WHERE user_id = ?", (message.from_user.id,))
+        db.commit()
+        await message.answer("🔔 Уведомления о новых сплетнях включены.")
+
+
 @dp.message(Command("id"))
 async def cmd_id(message: Message):
     await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
@@ -285,6 +395,9 @@ async def on_gossip(message: Message, bot: Bot):
         return
 
     text = message.text.strip()
+    if is_just_the_word_gossip(text):
+        await message.answer("Напиши саму сплетню, а не слово «сплетня» 🙂")
+        return
     if len(text) < MIN_LEN:
         await message.answer("Слишком коротко, расскажи подробнее 🙂")
         return
@@ -322,6 +435,8 @@ async def on_gossip(message: Message, bot: Bot):
             "Твоя сплетня принята ✅ Пока чужих сплетен нет, "
             "но как только появится новая, я пришлю её тебе."
         )
+
+    await maybe_broadcast(bot)
 
 
 @dp.callback_query(F.data.startswith("rep:"))
