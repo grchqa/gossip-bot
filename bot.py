@@ -22,7 +22,8 @@
 Сплетня дня:
   Каждый день в 13:00 по Москве всем подписчикам приходит одна случайная сплетня из обычного раздела.
   Если новой сплетни нет, приходит текст «Увы, пока нет новой сплетни. Самое время загрузить свою!».
-  В грязном разделе ежедневной рассылки нет.
+  В грязном разделе ежедневной рассылки нет, но есть кнопка «🎲 Случайная грязная сплетня»
+  (команда /random): раз в час выдаёт случайную сплетню из грязного раздела.
 
 Команды для всех:
   /start   - начало и кнопки разделов
@@ -87,7 +88,9 @@ NORMAL = "normal"
 DIRTY = "dirty"
 BTN_NORMAL = "💬 Обычные сплетни"
 BTN_DIRTY = "🔥 Грязные сплетни"
+BTN_RANDOM = "🎲 Случайная грязная сплетня"
 TITLES = {NORMAL: BTN_NORMAL, DIRTY: BTN_DIRTY}
+RANDOM_COOLDOWN_MIN = 60  # как часто можно жать «Случайная грязная сплетня» (у админа без ограничений)
 
 NO_NEW_TEXT = "😔 Увы, пока нет новой сплетни. Самое время загрузить свою!"
 
@@ -112,7 +115,8 @@ db.executescript(
         mode TEXT DEFAULT 'normal',
         dirty INTEGER DEFAULT 0,
         await_code INTEGER DEFAULT 0,
-        daily INTEGER DEFAULT 1
+        daily INTEGER DEFAULT 1,
+        last_random TEXT
     );
     CREATE TABLE IF NOT EXISTS gossips (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -170,6 +174,7 @@ for _table, _col, _ddl in [
     ("users", "dirty", "INTEGER DEFAULT 0"),
     ("users", "await_code", "INTEGER DEFAULT 0"),
     ("users", "daily", "INTEGER DEFAULT 1"),
+    ("users", "last_random", "TEXT"),
     ("gossips", "photo_id", "TEXT"),
     ("gossips", "section", "TEXT DEFAULT 'normal'"),
     ("gossips", "shown", "INTEGER DEFAULT 0"),
@@ -258,11 +263,12 @@ def vote_keyboard(gossip_id: int) -> InlineKeyboardMarkup:
     )
 
 
-def main_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text=BTN_NORMAL), KeyboardButton(text=BTN_DIRTY)]],
-        resize_keyboard=True,
-    )
+def main_keyboard(user_id: int | None = None) -> ReplyKeyboardMarkup:
+    """Две кнопки разделов; тем, у кого есть доступ в грязный раздел, добавляется ещё «Случайная»."""
+    rows = [[KeyboardButton(text=BTN_NORMAL), KeyboardButton(text=BTN_DIRTY)]]
+    if user_id is not None and has_dirty(user_id):
+        rows.append([KeyboardButton(text=BTN_RANDOM)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
 def meta_get(key: str, default=None):
@@ -516,7 +522,8 @@ def section_hint(section: str) -> str:
         return (
             "🔥 Ты в разделе «Грязные сплетни» (пробный раздел, пока бесплатно).\n"
             "Здесь всё анонимно. Пришли свою сплетню текстом или фото и получи чужую грязную. "
-            "Ежедневной рассылки в этом разделе нет.\n"
+            "Ежедневной рассылки в этом разделе нет, зато есть кнопка «🎲 Случайная грязная сплетня»: "
+            "раз в час она выдаёт случайную сплетню.\n"
             "Вернуться: кнопка «💬 Обычные сплетни»."
         )
     return (
@@ -551,7 +558,7 @@ async def cmd_start(message: Message):
         f"{BTN_DIRTY} (пробный раздел, пока бесплатно, вход по коду)\n\n"
         f"Сейчас ты в разделе: {TITLES[mode]}\n\n"
         "Просто отправь свою сплетню следующим сообщением 👇",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(message.from_user.id),
     )
 
 
@@ -822,7 +829,7 @@ async def on_btn_normal(message: Message):
     if is_banned(message.from_user.id):
         return
     set_user(message.from_user.id, mode=NORMAL, await_code=0)
-    await message.answer(section_hint(NORMAL), reply_markup=main_keyboard())
+    await message.answer(section_hint(NORMAL), reply_markup=main_keyboard(message.from_user.id))
 
 
 @dp.message(Command("dirty"))
@@ -834,15 +841,58 @@ async def on_btn_dirty(message: Message):
         return
     if has_dirty(uid):
         set_user(uid, mode=DIRTY, await_code=0)
-        await message.answer(section_hint(DIRTY), reply_markup=main_keyboard())
+        await message.answer(section_hint(DIRTY), reply_markup=main_keyboard(message.from_user.id))
         return
     set_user(uid, await_code=1)
     await message.answer(
         "🔥 «Грязные сплетни» — закрытый раздел. Сейчас он работает в пробном режиме и пока бесплатный.\n\n"
         "Чтобы войти, пришли одноразовый код доступа одним сообщением.\n"
         "Передумал? Нажми «💬 Обычные сплетни».",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(message.from_user.id),
     )
+
+
+@dp.message(Command("random"))
+@dp.message(F.text == BTN_RANDOM)
+async def on_random(message: Message, bot: Bot):
+    """Случайная грязная сплетня по кнопке: раз в час, только тем, у кого есть доступ в грязный раздел."""
+    ensure_user(message.from_user)
+    uid = message.from_user.id
+    if is_banned(uid):
+        return
+    if not has_dirty(uid):
+        await message.answer(
+            "🔥 Эта кнопка работает в разделе «Грязные сплетни». "
+            "Открой его кнопкой «🔥 Грязные сплетни» и введи код доступа."
+        )
+        return
+
+    row = db.execute("SELECT last_random FROM users WHERE user_id = ?", (uid,)).fetchone()
+    if not is_admin(uid) and row and row["last_random"]:
+        left = timedelta(minutes=RANDOM_COOLDOWN_MIN) - (datetime.now() - datetime.fromisoformat(row["last_random"]))
+        if left.total_seconds() > 0:
+            mins = int(left.total_seconds() // 60) + 1
+            await message.answer(f"⏳ Случайную грязную сплетню можно получать раз в час. Подожди ещё {mins} мин.")
+            return
+
+    g = db.execute(
+        """
+        SELECT id, text, photo_id FROM gossips
+        WHERE hidden = 0 AND section = ? AND author_id != ?
+          AND id NOT IN (SELECT gossip_id FROM seen WHERE user_id = ?)
+        ORDER BY RANDOM() LIMIT 1
+        """,
+        (DIRTY, uid, uid),
+    ).fetchone()
+    if g is None:
+        await message.answer("Новых грязных сплетен для тебя пока нет. Загляни позже или пришли свою 😏")
+        return
+
+    set_user(uid, last_random=datetime.now().isoformat())  # сначала отмечаем, чтобы двойное нажатие не сработало
+    ok = await send_gossip(bot, uid, g["id"], g["text"], g["photo_id"], DIRTY, title="🎲 Случайная грязная сплетня")
+    if not ok:
+        set_user(uid, last_random=None)
+        await message.answer("Не получилось отправить, попробуй ещё раз.")
 
 
 async def try_redeem_code(message: Message) -> None:
@@ -863,7 +913,7 @@ async def try_redeem_code(message: Message) -> None:
         return
     set_user(uid, dirty=1, mode=DIRTY, await_code=0)
     _code_fails.pop(uid, None)
-    await message.answer("✅ Код принят! Добро пожаловать.\n\n" + section_hint(DIRTY), reply_markup=main_keyboard())
+    await message.answer("✅ Код принят! Добро пожаловать.\n\n" + section_hint(DIRTY), reply_markup=main_keyboard(message.from_user.id))
 
 
 # ----- приём сплетен -------------------------------------------------------
@@ -1017,6 +1067,7 @@ async def setup_menu(bot: Bot) -> None:
     public = [
         BotCommand(command="normal", description=BTN_NORMAL),
         BotCommand(command="dirty", description=BTN_DIRTY),
+        BotCommand(command="random", description=BTN_RANDOM),
         BotCommand(command="daily", description="🔔 Сплетня дня: вкл/выкл"),
         BotCommand(command="start", description="🏠 Начало"),
     ]
