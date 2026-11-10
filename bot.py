@@ -6,12 +6,14 @@
 Если «Не согласны» набирается 3 и больше, сплетня автоматически удаляется у всех.
 
 Команды админа (ADMIN_ID):
+  (автоматически) каждая новая сплетня приходит админу сразу: текст или фото, номер автора, /del и /ban
+  /last [N]      - последние N сплетен (по умолчанию 10, максимум 30)
   /reported [N]  - сплетни, у которых есть голоса «Не согласен» (последние N, по умолчанию 10)
   /del <номер>   - удалить сплетню у всех
   /ban <id>      - забанить автора и удалить его сплетни
   /unban <id>    - разбанить
   /stats         - статистика
-Админ НЕ получает поток всех сплетен: он видит только то, что удалено по голосам или есть в /reported.
+Админ видит все сплетни: копия каждой приходит ему сразу, плюс уведомление, когда сплетня удалена по голосам.
 
 Команды для всех: /notify (вкл/выкл уведомления «появились новые сплетни»).
 
@@ -230,21 +232,38 @@ async def send_content(bot: Bot, chat_id: int, row) -> None:
 
 
 async def notify_admin_removed(bot: Bot, gossip_id: int) -> None:
-    """Админ узнаёт только об удалённых по голосам сплетнях: что это было и кто автор."""
+    """Админ узнаёт, что сплетня удалена по голосам (само содержимое он уже видел при публикации)."""
     if not ADMIN_ID:
         return
-    row = db.execute(
-        "SELECT author_id, text, photo_id FROM gossips WHERE id = ?", (gossip_id,)
-    ).fetchone()
+    row = db.execute("SELECT author_id FROM gossips WHERE id = ?", (gossip_id,)).fetchone()
     if not row:
         return
     agree, disagree = vote_counts(gossip_id)
     try:
-        await send_content(bot, ADMIN_ID, row)
         await bot.send_message(
             ADMIN_ID,
             f"🗑 Сплетня №{gossip_id} удалена по голосам (👍 {agree} / 👎 {disagree})\n"
             f"Автор: {row['author_id']}\n/ban {row['author_id']}",
+        )
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+
+
+async def notify_admin_new_gossip(bot: Bot, gossip_id: int, user, text: str, photo_id: str | None) -> None:
+    """Копия каждой новой сплетни админу (текст или фото) с номером автора для модерации."""
+    if not ADMIN_ID or user.id == ADMIN_ID:
+        return
+    try:
+        if photo_id:
+            caption = f"🤫 №{gossip_id}" + (f"\n\n{text}" if text else "")
+            sent = await bot.send_photo(ADMIN_ID, photo_id, caption=caption)
+        else:
+            sent = await bot.send_message(ADMIN_ID, f"🤫 №{gossip_id}\n\n{text}")
+        uname = f"@{user.username}" if user.username else "без юзернейма"
+        await bot.send_message(
+            ADMIN_ID,
+            f"Автор: {user.id} ({uname})\n/del {gossip_id}   /ban {user.id}",
+            reply_to_message_id=sent.message_id,
         )
     except (TelegramForbiddenError, TelegramBadRequest):
         pass
@@ -402,6 +421,57 @@ async def cmd_del(message: Message, bot: Bot):
     await message.answer(f"Сплетня №{parts[1]} удалена.")
 
 
+@dp.message(Command("last"))
+async def cmd_last(message: Message, bot: Bot):
+    """Последние сплетни (текст и фото): /last (10 штук) или /last 25 (не больше 30)."""
+    if not ADMIN_ID or message.from_user.id != ADMIN_ID:
+        return
+    parts = (message.text or "").split()
+    n = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 10
+    n = max(1, min(n, 30))
+
+    rows = db.execute(
+        "SELECT id, author_id, text, photo_id, created_at, hidden FROM gossips ORDER BY id DESC LIMIT ?",
+        (n,),
+    ).fetchall()
+    if not rows:
+        await message.answer("Сплетен пока нет.")
+        return
+
+    def meta_line(r) -> str:
+        when = datetime.fromisoformat(r["created_at"]).strftime("%d.%m %H:%M")
+        agree, disagree = vote_counts(r["id"])
+        flags = " [УДАЛЕНА]" if r["hidden"] else ""
+        if agree or disagree:
+            flags += f" [👍 {agree} / 👎 {disagree}]"
+        return f"№{r['id']} · {when} · автор {r['author_id']}{flags}"
+
+    buf = ""
+
+    async def flush():
+        nonlocal buf
+        if buf:
+            await message.answer(buf)
+            buf = ""
+
+    for r in reversed(rows):  # старые сверху, самые новые внизу
+        tail = f"/del {r['id']}   /ban {r['author_id']}"
+        if r["photo_id"]:
+            await flush()
+            caption = f"{meta_line(r)}\n{(r['text'] or '')[:700]}\n{tail}"
+            try:
+                await bot.send_photo(message.from_user.id, r["photo_id"], caption=caption)
+            except (TelegramForbiddenError, TelegramBadRequest):
+                await message.answer(f"{meta_line(r)}\n(фото недоступно)\n{tail}")
+            continue
+        text = r["text"] if len(r["text"]) <= 1500 else r["text"][:1500] + "… (обрезано)"
+        block = f"{meta_line(r)}\n{text}\n{tail}"
+        if buf and len(buf) + len(block) + 2 > 3800:
+            await flush()
+        buf = f"{buf}\n\n{block}" if buf else block
+    await flush()
+
+
 @dp.message(Command("reported"))
 async def cmd_reported(message: Message, bot: Bot):
     """Сплетни, у которых есть голоса «Не согласен»: /reported (10 штук) или /reported 20 (не больше 20)."""
@@ -483,6 +553,9 @@ async def process_gossip(message: Message, bot: Bot, text: str, photo_id: str | 
     )
     gossip_id = cur.lastrowid
     db.commit()
+
+    # Копия сплетни админу
+    await notify_admin_new_gossip(bot, gossip_id, message.from_user, text, photo_id)
 
     # Новую сплетню сразу отдаём тому, кто ждёт
     await deliver_to_pending(bot, gossip_id, text, photo_id, user_id)
