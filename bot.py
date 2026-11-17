@@ -4,6 +4,8 @@
 Внизу экрана три кнопки: «Секрет», «Высказаться», «Секретный чат».
 
 РАЗДЕЛ «СЕКРЕТ» (/main):
+  При входе бот сразу показывает непрочитанную чужую сплетню (или «Пока ничего нет, самое время поделиться»).
+  Новые сплетни приходят сами всем, у кого сейчас открыт этот раздел.
   Пришли свою сплетню (текстом или фото), получи чужую. К каждой сплетне бот в конце дописывает
   «от Коли» (случайное имя из списка), например: «я сегодня был пьяный. от Коли».
   Под чужой сплетней кнопки «Согласен» / «Не согласен». 3 и больше «Не согласен» = сплетня удаляется у всех.
@@ -72,7 +74,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 DB_PATH = os.getenv("DB_PATH", "gossip.db")
 
-BOT_VERSION = "v10: чистое меню (3 пункта), /news для рассылки новостей, /update для обновления у всех"
+BOT_VERSION = "v11: автоподгрузка сплетен и мыслей при входе и вживую, /news, /update, чистое меню"
 
 BTN_SECRET = "🤫 Секрет"
 BTN_VENT = "💭 Высказаться"
@@ -404,18 +406,22 @@ async def deliver_to_pending(bot: Bot, gossip_id: int, text: str, photo_id: str 
             return
 
 
-def vent_recipients(author_id: int):
-    """Кто получит мысль: все, у кого сейчас выбран раздел «Высказаться»."""
+def vent_recipients(author_id: int, section: str = "vent"):
+    """Кто получит новую сплетню/мысль сразу: все, у кого сейчас открыт этот раздел.
+    Автор и админ не получают (админ и так видит копию каждой записи)."""
     return db.execute(
-        "SELECT user_id FROM users WHERE banned = 0 AND section = 'vent' AND user_id != ?", (author_id,)
+        "SELECT user_id FROM users WHERE banned = 0 AND section = ? AND user_id != ? AND user_id != ?",
+        (section, author_id, ADMIN_ID),
     ).fetchall()
 
 
-async def broadcast_thought(bot: Bot, gossip_id: int, text: str, photo_id: str | None, author_id: int) -> None:
-    """Мысль из «Высказаться» автоматически приходит всем, у кого сейчас выбран этот раздел (кроме автора)."""
+async def broadcast_thought(bot: Bot, gossip_id: int, text: str, photo_id: str | None, author_id: int,
+                            section: str = "vent") -> None:
+    """Новая сплетня («Секрет») или мысль («Высказаться») сразу приходит всем, у кого сейчас открыт этот раздел."""
     try:
-        rows = vent_recipients(author_id)
+        rows = vent_recipients(author_id, section)
         for row in rows:
+            db.execute("DELETE FROM pending WHERE user_id = ?", (row["user_id"],))
             try:
                 await send_gossip(bot, row["user_id"], gossip_id, text, photo_id)
             except TelegramRetryAfter as e:
@@ -427,6 +433,21 @@ async def broadcast_thought(bot: Bot, gossip_id: int, text: str, photo_id: str |
             await asyncio.sleep(0.05)  # не превышаем лимит Telegram
     except Exception:
         logging.exception("Ошибка рассылки мысли")
+
+
+EMPTY_TEXT = "Пока ничего нет, самое время поделиться 🙂"
+
+
+async def show_next(bot: Bot, user_id: int, section: str) -> None:
+    """При входе в раздел сразу подгружает непрочитанную чужую сплетню/мысль, а если их нет, пишет, что пусто."""
+    row = pick_gossip_for(user_id, section)
+    if row:
+        await send_gossip(bot, user_id, row["id"], row["text"], row["photo_id"])
+    else:
+        try:
+            await bot.send_message(user_id, EMPTY_TEXT)
+        except (TelegramForbiddenError, TelegramBadRequest):
+            pass
 
 
 async def remove_gossip(bot: Bot, gossip_id: int) -> None:
@@ -707,7 +728,8 @@ async def setup_menu(bot: Bot) -> None:
 
 WELCOME_MAIN = (
     "🤫 Секрет\n\n"
-    "Пришли мне сплетню (текстом или фото), и я сразу дам тебе чужую. Сначала ты, потом тебе.\n"
+    "Открыл раздел, и я сразу показываю чужую сплетню. Новые приходят сами, пока ты здесь.\n"
+    "Хочешь поделиться своей? Пришли её текстом или фото, и я дам тебе ещё одну чужую.\n"
     "Всё анонимно.\n"
     "Под чужой сплетней можно нажать «Согласен» или «Не согласен»: если трое не согласны, сплетня удаляется.\n\n"
     "Просто отправь свою сплетню следующим сообщением 👇"
@@ -716,7 +738,7 @@ WELCOME_VENT = (
     "💭 Высказаться\n\n"
     "Напиши мысль или отправь фото, всё анонимно и без лимита. Твоя мысль автоматически придёт всем, "
     "у кого сейчас открыт этот раздел, и любой из них сможет ответить тебе анонимно: поддержать или поговорить.\n"
-    "Чужие мысли тоже будут приходить тебе сюда, пока этот раздел выбран.\n\n"
+    "Одну чужую мысль я покажу сразу, а новые будут приходить сами, пока этот раздел открыт.\n\n"
     "Просто напиши следующим сообщением 👇"
 )
 WELCOME_CHAT = (
@@ -734,6 +756,8 @@ async def enter_section(message: Message, section: str, text: str) -> None:
         return
     set_section(message.from_user.id, section)
     await message.answer(text, reply_markup=main_kb())
+    if section in ("main", "vent"):
+        await show_next(message.bot, message.from_user.id, section)
 
 
 @dp.message(CommandStart())
@@ -751,6 +775,7 @@ async def cmd_start(message: Message):
         + WELCOME_MAIN,
         reply_markup=main_kb(),
     )
+    await show_next(message.bot, message.from_user.id, "main")
 
 
 @dp.message(Command("vent"))
@@ -1234,8 +1259,10 @@ async def process_gossip(message: Message, bot: Bot, text: str, photo_id: str | 
     # Копия админу
     await notify_admin_new_gossip(bot, gossip_id, message.from_user, text, photo_id, section, name)
 
-    # Новую сплетню сразу отдаём тому, кто ждёт
-    await deliver_to_pending(bot, gossip_id, text, photo_id, user_id, section)
+    # Новая сплетня сразу приходит всем, у кого сейчас открыт раздел «Секрет» (в фоне)
+    task = asyncio.create_task(broadcast_thought(bot, gossip_id, text, photo_id, user_id, section))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
     # Взамен выдаём автору чужую
     row = pick_gossip_for(user_id, section)
