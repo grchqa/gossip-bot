@@ -9,13 +9,14 @@
   Под чужой сплетней кнопки «Согласен» / «Не согласен». 3 и больше «Не согласен» = сплетня удаляется у всех.
 
 РАЗДЕЛ «ВЫСКАЗАТЬСЯ» (/vent):
-  Человек анонимно пишет мысль (текст или фото), без лимита. Мысль приходит ВСЕМ участникам бота.
+  Человек анонимно пишет мысль (текст или фото), без лимита. Мысль автоматически приходит всем,
+  у кого сейчас выбран раздел «Высказаться» (как уведомление).
   Под мыслью кнопка «Ответить»: ответ уходит автору анонимно, дальше они могут переписываться,
   оба остаются анонимными. Отвечать может любой. Любой участник может закрыть диалог кнопкой «Закрыть».
 
 РАЗДЕЛ «СЕКРЕТНЫЙ ЧАТ» (/secret):
-  Личный чат с основателем (текст и фото). Основатель видит, кто пишет (ID и юзернейм).
-  Ответить человеку: ответом (reply) на его сообщение в боте.
+  Личный чат с основателем (текст и фото). Основателю имя и юзернейм не показываются:
+  он видит только «Аноним №...». Ответить: reply на сообщение. Забанить: reply с текстом /ban.
 
 Команды админа (ADMIN_ID):
   (автоматически) копия каждой новой сплетни и каждой новой мысли: содержимое, автор, /del и /ban.
@@ -28,7 +29,7 @@
   /names           - список имён для игры; /addname Имя; /delname Имя
   /stats           - статистика
 
-Для всех: /main, /vent, /secret, /notify (вкл/выкл уведомления о новых сплетнях и мыслях), /id.
+Для всех: /main, /vent, /secret, /notify (вкл/выкл уведомления о новых сплетнях), /id.
 
 Переменные окружения:
   BOT_TOKEN  - токен от @BotFather (обязательно)
@@ -41,6 +42,7 @@ import os
 import random
 import re
 import sqlite3
+import zlib
 from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher, F
@@ -60,7 +62,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 DB_PATH = os.getenv("DB_PATH", "gossip.db")
 
-BOT_VERSION = "v8: нижние кнопки «Секрет» / «Высказаться» / «Секретный чат» (раздела 18+ нет)"
+BOT_VERSION = "v9: нижние кнопки «Секрет» / «Высказаться» / «Секретный чат», мысли приходят тем, у кого открыт раздел"
 
 BTN_SECRET = "🤫 Секрет"
 BTN_VENT = "💭 Высказаться"
@@ -392,12 +394,17 @@ async def deliver_to_pending(bot: Bot, gossip_id: int, text: str, photo_id: str 
             return
 
 
+def vent_recipients(author_id: int):
+    """Кто получит мысль: все, у кого сейчас выбран раздел «Высказаться»."""
+    return db.execute(
+        "SELECT user_id FROM users WHERE banned = 0 AND section = 'vent' AND user_id != ?", (author_id,)
+    ).fetchall()
+
+
 async def broadcast_thought(bot: Bot, gossip_id: int, text: str, photo_id: str | None, author_id: int) -> None:
-    """Мысль из «Высказаться» уходит всем участникам бота (кроме автора, забаненных и отключивших уведомления)."""
+    """Мысль из «Высказаться» автоматически приходит всем, у кого сейчас выбран этот раздел (кроме автора)."""
     try:
-        rows = db.execute(
-            "SELECT user_id FROM users WHERE banned = 0 AND notify = 1 AND user_id != ?", (author_id,)
-        ).fetchall()
+        rows = vent_recipients(author_id)
         for row in rows:
             try:
                 await send_gossip(bot, row["user_id"], gossip_id, text, photo_id)
@@ -662,15 +669,16 @@ WELCOME_MAIN = (
 )
 WELCOME_VENT = (
     "💭 Высказаться\n\n"
-    "Напиши мысль или отправь фото, всё анонимно и без лимита. Твоя мысль придёт всем участникам бота, "
-    "а любой из них сможет ответить тебе анонимно: поддержать или поговорить.\n\n"
+    "Напиши мысль или отправь фото, всё анонимно и без лимита. Твоя мысль автоматически придёт всем, "
+    "у кого сейчас открыт этот раздел, и любой из них сможет ответить тебе анонимно: поддержать или поговорить.\n"
+    "Чужие мысли тоже будут приходить тебе сюда, пока этот раздел выбран.\n\n"
     "Просто напиши следующим сообщением 👇"
 )
 WELCOME_CHAT = (
     "🔒 Секретный чат\n\n"
     "Это личный чат с основателем бота, без цензуры: можно высказаться, пожаловаться или просто поделиться "
-    "чем-то, текстом или фото. Другим участникам это не показывается.\n"
-    "Важно: основатель видит, кто пишет (ваш ID и юзернейм).\n\n"
+    "чем-то, текстом или фото. Здесь всё анонимно: ваше имя и юзернейм не передаются, "
+    "а другим участникам это не показывается.\n\n"
     "Пишите следующим сообщением 👇"
 )
 
@@ -732,8 +740,16 @@ async def cmd_ban(message: Message, bot: Bot):
     if not ADMIN_ID or message.from_user.id != ADMIN_ID:
         return
     parts = (message.text or "").split()
+    via_reply = False
+    if len(parts) == 1 and message.reply_to_message:
+        r = db.execute(
+            "SELECT user_id FROM secret_map WHERE admin_msg_id = ?", (message.reply_to_message.message_id,)
+        ).fetchone()
+        if r:
+            parts = [parts[0], str(r["user_id"])]
+            via_reply = True
     if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
-        await message.answer("Формат: /ban <user_id>")
+        await message.answer("Формат: /ban <user_id> (или reply на сообщение из секретного чата)")
         return
     uid = int(parts[1])
     db.execute("INSERT OR IGNORE INTO users (user_id, created_at) VALUES (?, ?)", (uid, datetime.now().isoformat()))
@@ -744,7 +760,8 @@ async def cmd_ban(message: Message, bot: Bot):
     ids = [r["id"] for r in db.execute("SELECT id FROM gossips WHERE author_id = ? AND hidden = 0", (uid,))]
     for gid in ids:
         await remove_gossip(bot, gid)
-    await message.answer(f"Пользователь {uid} забанен, его сплетни удалены ({len(ids)}), диалоги закрыты.")
+    who = "" if via_reply else f" {uid}"
+    await message.answer(f"Пользователь{who} забанен, его сплетни удалены ({len(ids)}), диалоги закрыты.")
 
 
 @dp.message(Command("unban"))
@@ -943,11 +960,11 @@ async def cmd_notify(message: Message):
     if row["notify"]:
         db.execute("UPDATE users SET notify = 0 WHERE user_id = ?", (message.from_user.id,))
         db.commit()
-        await message.answer("🔕 Уведомления о новых сплетнях и мыслях выключены. Включить: /notify")
+        await message.answer("🔕 Уведомления о новых сплетнях выключены. Включить: /notify")
     else:
         db.execute("UPDATE users SET notify = 1 WHERE user_id = ?", (message.from_user.id,))
         db.commit()
-        await message.answer("🔔 Уведомления о новых сплетнях и мыслях включены.")
+        await message.answer("🔔 Уведомления о новых сплетнях включены.")
 
 
 @dp.message(Command("version"))
@@ -1018,24 +1035,26 @@ async def process_thought(message: Message, bot: Bot, text: str, photo_id: str |
 
     await notify_admin_new_gossip(bot, gossip_id, message.from_user, text, photo_id, "vent", None)
 
+    count = len(vent_recipients(user_id))
     task = asyncio.create_task(broadcast_thought(bot, gossip_id, text, photo_id, user_id))
     _bg_tasks.add(task)
     task.add_done_callback(_bg_tasks.discard)
 
-    await message.answer(
-        "💭 Твоя мысль отправлена всем участникам ✅\n"
-        "Если кто-то захочет поддержать, ответ придёт сюда анонимно."
-    )
+    if count:
+        info = f"Её получат те, у кого сейчас открыт раздел «Высказаться» ({count})."
+    else:
+        info = "Сейчас в разделе «Высказаться» больше никого нет, но мысль сохранена."
+    await message.answer(f"💭 Твоя мысль отправлена ✅\n{info}\nЕсли кто-то захочет поддержать, ответ придёт сюда анонимно.")
 
 
 async def forward_to_founder(message: Message, bot: Bot, text: str, photo_id: str | None = None) -> None:
-    """«Секретный чат»: сообщение уходит основателю (ADMIN_ID), он видит ID и юзернейм."""
+    """«Секретный чат»: сообщение уходит основателю (ADMIN_ID) без имени и юзернейма, только «Аноним №»."""
     if not ADMIN_ID:
         await message.answer("Секретный чат пока недоступен.")
         return
     u = message.from_user
-    uname = f"@{u.username}" if u.username else "без юзернейма"
-    head = f"🔒 Секретный чат · {u.id} ({uname})\nОтветить: reply на это сообщение"
+    num = zlib.crc32(f"{BOT_TOKEN}{u.id}".encode()) % 100000
+    head = f"🔒 Секретный чат · Аноним №{num}\nОтветить: reply на это сообщение. Забанить: reply с текстом /ban"
     try:
         if photo_id:
             sent = await bot.send_photo(ADMIN_ID, photo_id, caption=(head + (f"\n\n{text}" if text else ""))[:1024])
