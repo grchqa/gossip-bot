@@ -46,13 +46,14 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    ReplyKeyboardRemove,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 DB_PATH = os.getenv("DB_PATH", "gossip.db")
 
-BOT_VERSION = "v6: сплетни с подписью «от Имени» + раздел «Высказаться» (раздела 18+ нет)"
+BOT_VERSION = "v7: сплетни с подписью «от Имени» + раздел «Высказаться» (раздела 18+ нет, нижних кнопок нет)"
 
 MIN_LEN = 5                  # минимальная длина сплетни
 MIN_LEN_VENT = 3             # минимальная длина мысли в «Высказаться»
@@ -607,7 +608,8 @@ async def cmd_start(message: Message):
         "если трое не согласны, сплетня удаляется.\n\n"
         "💭 Хочешь просто выговориться? Команда /vent: анонимно поделись мыслью, "
         "а другие смогут ответить, поддержать или поговорить с тобой.\n\n"
-        "Просто отправь свою сплетню следующим сообщением 👇"
+        "Просто отправь свою сплетню следующим сообщением 👇",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
@@ -621,7 +623,8 @@ async def cmd_vent(message: Message):
         "💭 Высказаться\n\n"
         "Напишите свою мысль (только текст), всё анонимно. Я сразу пришлю вам чью-то чужую мысль, "
         "а на вашу смогут ответить другие: поддержать или продолжить разговор прямо в боте.\n\n"
-        "К сплетням: /main"
+        "К сплетням: /main",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
@@ -631,7 +634,10 @@ async def cmd_main(message: Message):
     if is_banned(message.from_user.id):
         return
     set_section(message.from_user.id, "main")
-    await message.answer("🤫 Вы в разделе сплетен. Пришлите сплетню текстом или фото.\nВысказаться: /vent")
+    await message.answer(
+        "🤫 Вы в разделе сплетен. Пришлите сплетню текстом или фото.\nВысказаться: /vent",
+        reply_markup=ReplyKeyboardRemove(),
+    )
 
 
 @dp.message(Command("ban"))
