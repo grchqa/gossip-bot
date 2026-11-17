@@ -34,6 +34,8 @@
                      или reply на любое своё сообщение командой /news. Перед отправкой будет предпросмотр и подтверждение
   /update          - обновить бота у всех: заново ставит меню и нижние кнопки каждому пользователю
   /admin           - шпаргалка по командам админа
+  /thought <номер> - мысль из «Высказаться» и вся переписка под ней (каждое новое сообщение диалога
+                     также приходит админу копией с номером мысли)
 
 Для всех: /main, /vent, /secret, /notify (вкл/выкл уведомления о новых сплетнях), /id.
 
@@ -74,7 +76,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 DB_PATH = os.getenv("DB_PATH", "gossip.db")
 
-BOT_VERSION = "v11: автоподгрузка сплетен и мыслей при входе и вживую, /news, /update, чистое меню"
+BOT_VERSION = "v12: диалоги привязаны к номеру мысли, /thought для админа, автоподгрузка, /news, /update"
 
 BTN_SECRET = "🤫 Секрет"
 BTN_VENT = "💭 Высказаться"
@@ -169,6 +171,14 @@ db.executescript(
         closed INTEGER DEFAULT 0,
         msg_count INTEGER DEFAULT 0,
         UNIQUE (gossip_id, responder_id)
+    );
+    CREATE TABLE IF NOT EXISTS thread_msgs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        thread_id INTEGER,
+        sender_id INTEGER,
+        text TEXT,
+        photo_id TEXT,
+        created_at TEXT
     );
     """
 )
@@ -369,7 +379,7 @@ async def send_gossip(bot: Bot, user_id: int, gossip_id: int, text: str, photo_i
     """Отправляет сплетню или мысль. False, если пользователь заблокировал бота."""
     srow = db.execute("SELECT section, name FROM gossips WHERE id = ?", (gossip_id,)).fetchone()
     if srow and srow["section"] == "vent":
-        kb, title, shown = thought_keyboard(gossip_id), "💭 Чья-то мысль", text
+        kb, title, shown = thought_keyboard(gossip_id), f"💭 Мысль №{gossip_id}", text
     else:
         kb, title = vote_keyboard(gossip_id), "🤫 Чужая сплетня"
         shown = with_name(text, srow["name"] if srow else None)
@@ -603,6 +613,32 @@ def is_just_the_word_gossip(text: str) -> bool:
 # --------------------------------------------------------------------------
 # Анонимные диалоги («Высказаться»)
 # --------------------------------------------------------------------------
+def thought_snippet(gossip_id: int, n: int = 80) -> str:
+    """Короткая выдержка из мысли, чтобы в диалоге всегда было видно, о какой мысли речь."""
+    g = db.execute("SELECT text FROM gossips WHERE id = ?", (gossip_id,)).fetchone()
+    t = ((g["text"] or "") if g else "").replace("\n", " ").strip()
+    t = t[:n] + ("…" if len(t) > n else "")
+    return t or "фото"
+
+
+async def notify_admin_dialog(bot: Bot, th, sender_id: int, text: str, photo_id: str | None) -> None:
+    """Админ видит каждое сообщение диалога с пометкой, к какой мысли оно относится."""
+    if not ADMIN_ID or ADMIN_ID in (th["author_id"], th["responder_id"]):
+        return
+    role = "автор мысли" if sender_id == th["author_id"] else "отвечающий"
+    gid = th["gossip_id"]
+    head = (f"👁 Мысль №{gid} · диалог №{th['id']}\n«{thought_snippet(gid, 120)}»\n"
+            f"{role} {sender_id}:")
+    tail = f"\n\n/thought {gid}   /ban {sender_id}"
+    try:
+        if photo_id:
+            await bot.send_photo(ADMIN_ID, photo_id, caption=(head + (f"\n{text}" if text else "") + tail)[:1024])
+        else:
+            await bot.send_message(ADMIN_ID, (head + f"\n{text}" + tail)[:4096])
+    except (TelegramForbiddenError, TelegramBadRequest):
+        pass
+
+
 def get_thread(thread_id: int):
     return db.execute("SELECT * FROM threads WHERE id = ?", (thread_id,)).fetchone()
 
@@ -659,12 +695,12 @@ async def relay_message(message: Message, bot: Bot, text: str, thread_id: int, p
         await message.answer("Собеседник недоступен, диалог закрыт.")
         return
 
-    header = f"💬 Диалог №{thread_id}"
-    if th["msg_count"] == 0 and uid == th["responder_id"]:
-        g = db.execute("SELECT text FROM gossips WHERE id = ?", (th["gossip_id"],)).fetchone()
-        snippet = (g["text"] or "") if g else ""
-        snippet = snippet[:120] + ("…" if len(snippet) > 120 else "")
-        header += f"\nОтвет на вашу мысль: «{snippet or 'фото'}»"
+    gid = th["gossip_id"]
+    snip = thought_snippet(gid)
+    if other == th["author_id"]:
+        header = f"💬 Ответ на твою мысль №{gid}\n«{snip}»"
+    else:
+        header = f"💬 Автор мысли №{gid} пишет тебе\n«{snip}»"
     try:
         if photo_id:
             caption = (header + (f"\n\n{text}" if text else ""))[:1024]
@@ -676,7 +712,13 @@ async def relay_message(message: Message, bot: Bot, text: str, thread_id: int, p
         await message.answer("Не удалось доставить: собеседник недоступен. Диалог закрыт.")
         return
     db.execute("UPDATE threads SET msg_count = msg_count + 1 WHERE id = ?", (thread_id,))
+    db.execute(
+        "INSERT INTO thread_msgs (thread_id, sender_id, text, photo_id, created_at) VALUES (?, ?, ?, ?, ?)",
+        (thread_id, uid, text, photo_id, datetime.now().isoformat()),
+    )
     db.commit()
+    await message.answer(f"✅ Отправлено в диалог по мысли №{gid}")
+    await notify_admin_dialog(bot, th, uid, text, photo_id)
 
 
 # --------------------------------------------------------------------------
@@ -738,7 +780,9 @@ WELCOME_VENT = (
     "💭 Высказаться\n\n"
     "Напиши мысль или отправь фото, всё анонимно и без лимита. Твоя мысль автоматически придёт всем, "
     "у кого сейчас открыт этот раздел, и любой из них сможет ответить тебе анонимно: поддержать или поговорить.\n"
-    "Одну чужую мысль я покажу сразу, а новые будут приходить сами, пока этот раздел открыт.\n\n"
+    "Одну чужую мысль я покажу сразу, а новые будут приходить сами, пока этот раздел открыт.\n"
+    "Ответы всегда подписаны номером мысли, к которой они относятся.\n"
+    "Основатель бота видит мысли и переписку в этом разделе для модерации.\n\n"
     "Просто напиши следующим сообщением 👇"
 )
 WELCOME_CHAT = (
@@ -937,6 +981,10 @@ async def cmd_last(message: Message, bot: Bot):
         if r["name"]:
             flags += f" [🎲 {r['name']}]"
         mark = "💭 " if r["section"] == "vent" else ""
+        if r["section"] == "vent":
+            dialogs = db.execute("SELECT COUNT(*) FROM threads WHERE gossip_id = ?", (r["id"],)).fetchone()[0]
+            if dialogs:
+                flags += f" [💬 диалогов: {dialogs}, смотреть: /thought {r['id']}]"
         return f"{mark}№{r['id']} · {when} · автор {r['author_id']}{flags}"
 
     buf = ""
@@ -1222,6 +1270,55 @@ async def cmd_update(message: Message, bot: Bot):
     task.add_done_callback(_bg_tasks.discard)
 
 
+@dp.message(Command("thought"), F.from_user.id == ADMIN_ID)
+async def cmd_thought(message: Message, bot: Bot):
+    """Мысль целиком и все диалоги под ней: /thought 12"""
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Формат: /thought <номер_мысли>. Номера видно в /last и в копиях сообщений.")
+        return
+    gid = int(parts[1])
+    g = db.execute("SELECT * FROM gossips WHERE id = ? AND section = 'vent'", (gid,)).fetchone()
+    if not g:
+        await message.answer("Такой мысли нет в «Высказаться».")
+        return
+    when = datetime.fromisoformat(g["created_at"]).strftime("%d.%m %H:%M")
+    flag = " [УДАЛЕНА]" if g["hidden"] else ""
+    await message.answer(f"💭 Мысль №{gid} · {when} · автор {g['author_id']}{flag}")
+    try:
+        await send_content(bot, message.from_user.id, g)
+    except (TelegramForbiddenError, TelegramBadRequest):
+        await message.answer("(не удалось показать содержимое)")
+    threads = db.execute("SELECT * FROM threads WHERE gossip_id = ? ORDER BY id", (gid,)).fetchall()
+    if not threads:
+        await message.answer(f"Под мыслью №{gid} пока нет диалогов.\n/del {gid}   /ban {g['author_id']}")
+        return
+    for t in threads:
+        msgs = db.execute(
+            "SELECT sender_id, text, photo_id, created_at FROM thread_msgs WHERE thread_id = ? ORDER BY id",
+            (t["id"],),
+        ).fetchall()
+        closed = " [ЗАКРЫТ]" if t["closed"] else ""
+        block = [f"💬 Диалог №{t['id']}{closed} · отвечающий {t['responder_id']}"]
+        if not msgs:
+            block.append("(сообщений нет или они написаны до обновления)")
+        for m in msgs:
+            who = "автор" if m["sender_id"] == t["author_id"] else "отвечающий"
+            hhmm = datetime.fromisoformat(m["created_at"]).strftime("%d.%m %H:%M")
+            body = (m["text"] or "") + (" [фото]" if m["photo_id"] else "")
+            block.append(f"{hhmm} {who}: {body.strip()}")
+        chunk = ""
+        for line in block:
+            line = line[:1500]
+            if chunk and len(chunk) + len(line) + 1 > 3800:
+                await message.answer(chunk)
+                chunk = ""
+            chunk = f"{chunk}\n{line}" if chunk else line
+        if chunk:
+            await message.answer(chunk)
+    await message.answer(f"/del {gid}   /ban {g['author_id']}")
+
+
 @dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
 async def cmd_admin_help(message: Message):
     await message.answer(
@@ -1229,6 +1326,7 @@ async def cmd_admin_help(message: Message):
         "/news текст: новость всем (в любом разделе), можно с фото\n"
         "/update: обновить бота и кнопки у всех\n"
         "/last [N], /reported [N]: сплетни и мысли\n"
+        "/thought <номер>: мысль и все диалоги под ней\n"
         "/del <номер>, /ban <id>, /unban <id>\n"
         "/names, /addname, /delname: имена\n"
         "/stats, /version"
@@ -1303,7 +1401,11 @@ async def process_thought(message: Message, bot: Bot, text: str, photo_id: str |
         info = f"Её получат те, у кого сейчас открыт раздел «Высказаться» ({count})."
     else:
         info = "Сейчас в разделе «Высказаться» больше никого нет, но мысль сохранена."
-    await message.answer(f"💭 Твоя мысль отправлена ✅\n{info}\nЕсли кто-то захочет поддержать, ответ придёт сюда анонимно.")
+    await message.answer(
+        f"💭 Твоя мысль №{gossip_id} отправлена ✅\n{info}\n"
+        f"Ответы на неё будут приходить с пометкой «Ответ на твою мысль №{gossip_id}», так не запутаешься, "
+        "даже если напишешь ещё мысли."
+    )
 
 
 async def forward_to_founder(message: Message, bot: Bot, text: str, photo_id: str | None = None) -> None:
@@ -1508,8 +1610,9 @@ async def on_thought_reply(cb: CallbackQuery):
     activate_thread(uid, tid)
     await cb.answer()
     await cb.message.answer(
-        f"💬 Диалог №{tid} открыт. Пишите, ваши сообщения уйдут автору анонимно, вы тоже останетесь анонимным.\n"
-        "Выйти из диалога: /vent"
+        f"💬 Ты отвечаешь на мысль №{gossip_id}:\n«{thought_snippet(gossip_id)}»\n\n"
+        "Пиши, сообщения уйдут автору анонимно, ты тоже останешься анонимным.\n"
+        "Написать новую мысль или выйти из диалога: кнопка «Высказаться» внизу."
     )
 
 
@@ -1531,7 +1634,12 @@ async def on_relay_reply(cb: CallbackQuery):
         return
     activate_thread(uid, tid)
     await cb.answer()
-    await cb.message.answer(f"↩️ Вы в диалоге №{tid}. Пишите, сообщения уйдут анонимно.\nВыйти из диалога: /vent")
+    gid = th["gossip_id"]
+    await cb.message.answer(
+        f"↩️ Ты в диалоге по мысли №{gid}:\n«{thought_snippet(gid)}»\n\n"
+        "Пиши, сообщения уйдут анонимно.\n"
+        "Написать новую мысль или выйти из диалога: кнопка «Высказаться» внизу."
+    )
 
 
 @dp.callback_query(F.data.startswith("x:"))
@@ -1554,7 +1662,9 @@ async def on_close_thread(cb: CallbackQuery, bot: Bot):
     except TelegramBadRequest:
         pass
     try:
-        await bot.send_message(thread_other(th, uid), f"🚫 Собеседник закрыл диалог №{tid}.")
+        await bot.send_message(
+            thread_other(th, uid), f"🚫 Собеседник закрыл диалог по мысли №{th['gossip_id']}."
+        )
     except (TelegramForbiddenError, TelegramBadRequest):
         pass
 
