@@ -28,6 +28,10 @@
   /unban <id>      - разбанить
   /names           - список имён для игры; /addname Имя; /delname Имя
   /stats           - статистика
+  /news <текст>    - новость всем пользователям (в любом разделе). Можно с фото: фото + подпись «/news текст»,
+                     или reply на любое своё сообщение командой /news. Перед отправкой будет предпросмотр и подтверждение
+  /update          - обновить бота у всех: заново ставит меню и нижние кнопки каждому пользователю
+  /admin           - шпаргалка по командам админа
 
 Для всех: /main, /vent, /secret, /notify (вкл/выкл уведомления о новых сплетнях), /id.
 
@@ -50,6 +54,12 @@ from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, Teleg
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
+    BotCommandScopeAllChatAdministrators,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeAllPrivateChats,
+    BotCommandScopeChat,
+    BotCommandScopeDefault,
+    MenuButtonCommands,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -62,7 +72,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 DB_PATH = os.getenv("DB_PATH", "gossip.db")
 
-BOT_VERSION = "v9: нижние кнопки «Секрет» / «Высказаться» / «Секретный чат», мысли приходят тем, у кого открыт раздел"
+BOT_VERSION = "v10: чистое меню (3 пункта), /news для рассылки новостей, /update для обновления у всех"
 
 BTN_SECRET = "🤫 Секрет"
 BTN_VENT = "💭 Высказаться"
@@ -657,8 +667,43 @@ MENU_COMMANDS = [
     BotCommand(command="main", description="Секрет"),
     BotCommand(command="vent", description="Высказаться"),
     BotCommand(command="secret", description="Секретный чат"),
-    BotCommand(command="notify", description="Уведомления вкл/выкл"),
 ]
+
+
+async def setup_menu(bot: Bot) -> None:
+    """Полностью пересобирает меню команд (кнопка слева внизу): стирает всё старое во всех областях
+    и языках, оставляет только три пункта. Telegram применяет это сразу для всех пользователей."""
+    scopes = [
+        BotCommandScopeDefault(),
+        BotCommandScopeAllPrivateChats(),
+        BotCommandScopeAllGroupChats(),
+        BotCommandScopeAllChatAdministrators(),
+    ]
+    if ADMIN_ID:
+        scopes.append(BotCommandScopeChat(chat_id=ADMIN_ID))
+    # 1) стираем старые списки (в том числе заданные раньше через @BotFather и для отдельных языков)
+    for scope in scopes:
+        for lang in (None, "ru", "en", "uk", "be", "kk"):
+            try:
+                await bot.delete_my_commands(scope=scope, language_code=lang)
+            except Exception:
+                logging.exception("Не удалось очистить меню (%s, %s)", scope.type, lang)
+    # 2) ставим новый список
+    for scope in (BotCommandScopeDefault(), BotCommandScopeAllPrivateChats()):
+        try:
+            await bot.set_my_commands(MENU_COMMANDS, scope=scope)
+        except Exception:
+            logging.exception("Не удалось задать меню команд")
+    if ADMIN_ID:
+        try:
+            await bot.set_my_commands(MENU_COMMANDS, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+        except Exception:
+            logging.exception("Не удалось задать меню админа")
+    # 3) кнопка меню слева внизу = список команд
+    try:
+        await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    except Exception:
+        logging.exception("Не удалось задать кнопку меню")
 
 WELCOME_MAIN = (
     "🤫 Секрет\n\n"
@@ -976,6 +1021,193 @@ async def cmd_version(message: Message):
 @dp.message(Command("id"))
 async def cmd_id(message: Message):
     await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
+
+
+# --------------------------------------------------------------------------
+# Админ: новости всем и обновление бота у всех
+# --------------------------------------------------------------------------
+NEWS_HEADER = "📢 Новость от основателя"
+NEWS_DRAFTS: dict[int, dict] = {}   # черновик новости админа до подтверждения
+_mass_running = False               # идёт ли сейчас массовая отправка (новость или обновление)
+
+
+def mass_recipients(exclude: int | None = None) -> list[int]:
+    """Все не забаненные пользователи, независимо от выбранного раздела."""
+    rows = db.execute("SELECT user_id FROM users WHERE banned = 0").fetchall()
+    return [r["user_id"] for r in rows if r["user_id"] != exclude]
+
+
+async def send_to_many(user_ids: list[int], send_fn) -> tuple[int, int]:
+    """Вызывает send_fn(uid) для каждого, соблюдая лимиты Telegram. Возвращает (доставлено, не доставлено)."""
+    ok = fail = 0
+    for uid in user_ids:
+        delivered = False
+        for _attempt in range(2):
+            try:
+                await send_fn(uid)
+                delivered = True
+                break
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+            except Exception:
+                break  # заблокировал бота и т.п.
+        ok += delivered
+        fail += not delivered
+        await asyncio.sleep(0.05)  # около 20 сообщений в секунду, в рамках лимита
+    return ok, fail
+
+
+async def send_news_to(bot: Bot, uid: int, draft: dict, preview: bool = False) -> None:
+    text, photo_id = draft["text"], draft["photo_id"]
+    body = f"{NEWS_HEADER}\n\n{text}" if text else NEWS_HEADER
+    if photo_id:
+        await bot.send_photo(uid, photo_id, caption=body[:1024])
+    else:
+        await bot.send_message(uid, body[:4096])
+
+
+def news_keyboard(count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(text=f"✅ Отправить всем ({count})", callback_data="news:send"),
+            InlineKeyboardButton(text="✖️ Отмена", callback_data="news:cancel"),
+        ]]
+    )
+
+
+async def start_news_draft(message: Message, bot: Bot, text: str, photo_id: str | None) -> None:
+    text = (text or "").strip()
+    if not text and not photo_id:
+        await message.answer(
+            "Как отправить новость:\n"
+            "• /news Текст новости\n"
+            "• фото с подписью «/news Текст»\n"
+            "• или reply на своё сообщение командой /news"
+        )
+        return
+    if len(text) > 3900 or (photo_id and len(text) > 950):
+        await message.answer("Слишком длинно: до 3900 символов текстом или до 950 в подписи к фото.")
+        return
+    NEWS_DRAFTS[message.from_user.id] = {"text": text, "photo_id": photo_id}
+    count = len(mass_recipients(exclude=message.from_user.id))
+    await message.answer("Так новость увидят все (предпросмотр):")
+    await send_news_to(bot, message.from_user.id, NEWS_DRAFTS[message.from_user.id])
+    await message.answer(
+        f"Получат {count} чел. в любом разделе. Отправляем?", reply_markup=news_keyboard(count)
+    )
+
+
+@dp.message(Command("news"), F.from_user.id == ADMIN_ID)
+async def cmd_news(message: Message, bot: Bot):
+    parts = (message.text or "").split(maxsplit=1)
+    text = parts[1] if len(parts) > 1 else ""
+    photo_id = None
+    r = message.reply_to_message
+    if not text and r:
+        text = r.text or r.caption or ""
+        if r.photo:
+            photo_id = r.photo[-1].file_id
+    await start_news_draft(message, bot, text, photo_id)
+
+
+@dp.message(F.photo, F.caption.regexp(r"^/news(@\w+)?(\s|$)"), F.from_user.id == ADMIN_ID)
+async def cmd_news_photo(message: Message, bot: Bot):
+    parts = (message.caption or "").split(maxsplit=1)
+    text = parts[1] if len(parts) > 1 else ""
+    await start_news_draft(message, bot, text, message.photo[-1].file_id)
+
+
+async def _do_news(bot: Bot, admin_chat: int, draft: dict) -> None:
+    global _mass_running
+    try:
+        ids = mass_recipients(exclude=ADMIN_ID)
+        ok, fail = await send_to_many(ids, lambda uid: send_news_to(bot, uid, draft))
+        await bot.send_message(admin_chat, f"📢 Новость разослана: доставлено {ok}, не доставлено {fail} (заблокировали бота).")
+    except Exception:
+        logging.exception("Ошибка рассылки новости")
+    finally:
+        _mass_running = False
+
+
+@dp.callback_query(F.data.in_({"news:send", "news:cancel"}))
+async def on_news_confirm(cb: CallbackQuery, bot: Bot):
+    global _mass_running
+    if not ADMIN_ID or cb.from_user.id != ADMIN_ID:
+        await cb.answer()
+        return
+    draft = NEWS_DRAFTS.pop(cb.from_user.id, None)
+    try:
+        await cb.message.edit_reply_markup(reply_markup=None)
+    except TelegramBadRequest:
+        pass
+    if cb.data == "news:cancel":
+        await cb.answer("Отменено")
+        return
+    if not draft:
+        await cb.answer("Черновик устарел, отправь /news заново.", show_alert=True)
+        return
+    if _mass_running:
+        await cb.answer("Сейчас уже идёт другая рассылка, подожди.", show_alert=True)
+        return
+    _mass_running = True
+    await cb.answer("Отправляю…")
+    await cb.message.answer("⏳ Рассылаю новость, пришлю итог, когда закончу.")
+    task = asyncio.create_task(_do_news(bot, cb.message.chat.id, draft))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+UPDATE_TEXT = "🔄 Бот обновился! Кнопки внизу экрана обновлены 👇"
+
+
+async def _do_update(bot: Bot, admin_chat: int) -> None:
+    global _mass_running
+    try:
+        ids = mass_recipients()
+        ok, fail = await send_to_many(
+            ids,
+            lambda uid: bot.send_message(uid, UPDATE_TEXT, reply_markup=main_kb(), disable_notification=True),
+        )
+        await bot.send_message(admin_chat, f"✅ Обновление применено: кнопки обновлены у {ok}, не доставлено {fail}.")
+    except Exception:
+        logging.exception("Ошибка обновления у всех")
+    finally:
+        _mass_running = False
+
+
+@dp.message(Command("update"), F.from_user.id == ADMIN_ID)
+async def cmd_update(message: Message, bot: Bot):
+    """Применить настройки бота у всех сразу: меню команд + нижние кнопки каждому пользователю."""
+    global _mass_running
+    if _mass_running:
+        await message.answer("Сейчас уже идёт рассылка, подожди её окончания.")
+        return
+    _mass_running = True
+    try:
+        await setup_menu(bot)  # меню команд меняется у всех мгновенно
+        # на всякий случай: людей с неизвестным/устаревшим разделом возвращаем в «Секрет»
+        db.execute("UPDATE users SET section = 'main' WHERE section IS NULL OR section NOT IN ('main','vent','secret')")
+        db.commit()
+    except Exception:
+        _mass_running = False
+        raise
+    await message.answer("🔄 Меню обновлено. Рассылаю всем новые кнопки, пришлю итог.")
+    task = asyncio.create_task(_do_update(bot, message.chat.id))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
+@dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
+async def cmd_admin_help(message: Message):
+    await message.answer(
+        "Команды админа:\n"
+        "/news текст: новость всем (в любом разделе), можно с фото\n"
+        "/update: обновить бота и кнопки у всех\n"
+        "/last [N], /reported [N]: сплетни и мысли\n"
+        "/del <номер>, /ban <id>, /unban <id>\n"
+        "/names, /addname, /delname: имена\n"
+        "/stats, /version"
+    )
 
 
 async def process_gossip(message: Message, bot: Bot, text: str, photo_id: str | None = None) -> None:
@@ -1320,10 +1552,7 @@ async def main():
     logging.basicConfig(level=logging.INFO)
     logging.info("Запуск, версия бота: %s", BOT_VERSION)
     bot = Bot(BOT_TOKEN)
-    try:
-        await bot.set_my_commands(MENU_COMMANDS)
-    except Exception:
-        logging.exception("Не удалось задать меню команд")
+    await setup_menu(bot)
     await dp.start_polling(bot)
 
 
