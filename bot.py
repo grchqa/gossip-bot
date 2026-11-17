@@ -1,7 +1,7 @@
 """
 Бот "Сплетница" для Telegram (aiogram 3).
 
-Внизу экрана три кнопки: «Секрет», «Высказаться», «Секретный чат».
+Внизу экрана три кнопки: «Секрет», «Высказаться», «Секретная комната».
 
 РАЗДЕЛ «СЕКРЕТ» (/main):
   При входе бот сразу показывает непрочитанную чужую сплетню (или «Пока ничего нет, самое время поделиться»).
@@ -16,13 +16,17 @@
   Под мыслью кнопка «Ответить»: ответ уходит автору анонимно, дальше они могут переписываться,
   оба остаются анонимными. Отвечать может любой. Любой участник может закрыть диалог кнопкой «Закрыть».
 
-РАЗДЕЛ «СЕКРЕТНЫЙ ЧАТ» (/secret):
-  Личный чат с основателем (текст и фото). Основателю имя и юзернейм не показываются:
-  он видит только «Аноним №...». Ответить: reply на сообщение. Забанить: reply с текстом /ban.
+РАЗДЕЛ «СЕКРЕТНАЯ КОМНАТА» (/secret):
+  Вход по одноразовому паролю: 1 пароль = 1 человек. Пароли создаёт админ командой /newpass
+  (она есть в меню команд только у админа). Дальше человек пишет (текст и фото), сообщения уходят
+  только админу, который видит «Аноним №...» без имени и юзернейма.
+  Ответить: reply на сообщение. Забанить: reply с текстом /ban.
 
 Команды админа (ADMIN_ID):
   (автоматически) копия каждой новой сплетни и каждой новой мысли: содержимое, автор, /del и /ban.
-  Личные диалоги в «Высказаться» админу НЕ пересылаются.
+  Сообщения личных диалогов в «Высказаться» тоже приходят админу копией.
+  /newpass         - создать одноразовый пароль для «Секретной комнаты»
+  /passwords       - неиспользованные пароли и сколько уже использовано
   /last [N]        - последние N сплетен/мыслей (по умолчанию 10, максимум 30)
   /reported [N]    - сплетни, у которых есть голоса «Не согласен»
   /del <номер>     - удалить сплетню/мысль у всех
@@ -49,6 +53,7 @@ import logging
 import os
 import random
 import re
+import secrets
 import sqlite3
 import zlib
 from datetime import datetime, timedelta
@@ -76,11 +81,11 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 DB_PATH = os.getenv("DB_PATH", "gossip.db")
 
-BOT_VERSION = "v12: диалоги привязаны к номеру мысли, /thought для админа, автоподгрузка, /news, /update"
+BOT_VERSION = "v13: секретная комната с одноразовыми паролями, новое описание «Высказаться»"
 
 BTN_SECRET = "🤫 Секрет"
 BTN_VENT = "💭 Высказаться"
-BTN_CHAT = "🔒 Секретный чат"
+BTN_CHAT = "🔒 Секретная комната"
 # Кнопки старых версий бота: если у человека осталась старая клавиатура, заменяем её новой
 OLD_BUTTONS = {"💬 Обычные сплетни", "🔥 Грязные сплетни", "🎲 Случайная грязная сплетня"}
 
@@ -180,6 +185,12 @@ db.executescript(
         photo_id TEXT,
         created_at TEXT
     );
+    CREATE TABLE IF NOT EXISTS passwords (
+        code TEXT PRIMARY KEY,
+        created_at TEXT,
+        used_by INTEGER,
+        used_at TEXT
+    );
     """
 )
 # Если база осталась от старой версии бота, добавляем новые столбцы
@@ -188,6 +199,7 @@ for _table, _col, _ddl in [
     ("users", "section", "TEXT DEFAULT 'main'"),
     ("users", "adult_ok", "INTEGER DEFAULT 0"),
     ("users", "active_thread", "INTEGER"),
+    ("users", "room_ok", "INTEGER DEFAULT 0"),
     ("gossips", "photo_id", "TEXT"),
     ("gossips", "section", "TEXT DEFAULT 'main'"),
     ("gossips", "name", "TEXT"),
@@ -729,7 +741,11 @@ dp = Dispatcher()
 MENU_COMMANDS = [
     BotCommand(command="main", description="Секрет"),
     BotCommand(command="vent", description="Высказаться"),
-    BotCommand(command="secret", description="Секретный чат"),
+    BotCommand(command="secret", description="Секретная комната"),
+]
+# У админа в меню команд есть ещё пункт «создать пароль» (у остальных его нет)
+ADMIN_COMMANDS = MENU_COMMANDS + [
+    BotCommand(command="newpass", description="🔑 Создать пароль для комнаты"),
 ]
 
 
@@ -759,7 +775,7 @@ async def setup_menu(bot: Bot) -> None:
             logging.exception("Не удалось задать меню команд")
     if ADMIN_ID:
         try:
-            await bot.set_my_commands(MENU_COMMANDS, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+            await bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
         except Exception:
             logging.exception("Не удалось задать меню админа")
     # 3) кнопка меню слева внизу = список команд
@@ -778,19 +794,20 @@ WELCOME_MAIN = (
 )
 WELCOME_VENT = (
     "💭 Высказаться\n\n"
-    "Напиши мысль или отправь фото, всё анонимно и без лимита. Твоя мысль автоматически придёт всем, "
-    "у кого сейчас открыт этот раздел, и любой из них сможет ответить тебе анонимно: поддержать или поговорить.\n"
-    "Одну чужую мысль я покажу сразу, а новые будут приходить сами, пока этот раздел открыт.\n"
-    "Ответы всегда подписаны номером мысли, к которой они относятся.\n"
-    "Оскорбления запрещены. Сообщения в этом разделе модерируются, в том числе мат.\n\n"
+    "Мысли, секреты, высказывания. Тут ты можешь высказаться, и кто знает, кто напишет тебе ;)\n"
+    "Всё анонимно.\n\n"
+    "Оскорбления запрещены, сообщения модерируются.\n\n"
     "Просто напиши следующим сообщением 👇"
 )
+ROOM_LOCKED = (
+    "🔒 Секретная комната\n\n"
+    "Вход по одноразовому паролю. Введи его следующим сообщением 👇"
+)
 WELCOME_CHAT = (
-    "🔒 Секретный чат\n\n"
-    "Это личный чат с основателем бота, без цензуры: можно высказаться, пожаловаться или просто поделиться "
-    "чем-то, текстом или фото. Здесь всё анонимно: ваше имя и юзернейм не передаются, "
-    "а другим участникам это не показывается.\n\n"
-    "Пишите следующим сообщением 👇"
+    "🔒 Секретная комната\n\n"
+    "Свобода слова и мыслей. Всё анонимно: ваше имя и юзернейм не передаются. "
+    "Сообщения получает только администратор.\n\n"
+    "Пишите следующим сообщением (текст или фото) 👇"
 )
 
 
@@ -799,6 +816,8 @@ async def enter_section(message: Message, section: str, text: str) -> None:
     if is_banned(message.from_user.id):
         return
     set_section(message.from_user.id, section)
+    if section == "secret" and not has_room_access(message.from_user.id):
+        text = ROOM_LOCKED
     await message.answer(text, reply_markup=main_kb())
     if section in ("main", "vent"):
         await show_next(message.bot, message.from_user.id, section)
@@ -815,7 +834,7 @@ async def cmd_start(message: Message):
         "Внизу три кнопки:\n"
         "• «Секрет»: обменивайся сплетнями анонимно\n"
         "• «Высказаться»: поделись мыслью, а другие смогут поддержать тебя\n"
-        "• «Секретный чат»: личный чат с основателем бота\n\n"
+        "• «Секретная комната»: вход по паролю, свобода слова\n\n"
         + WELCOME_MAIN,
         reply_markup=main_kb(),
     )
@@ -1270,6 +1289,91 @@ async def cmd_update(message: Message, bot: Bot):
     task.add_done_callback(_bg_tasks.discard)
 
 
+# --------------------------------------------------------------------------
+# «Секретная комната»: одноразовые пароли (1 пароль = 1 человек)
+# --------------------------------------------------------------------------
+PW_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"  # без похожих символов (0/O, 1/I)
+PW_MAX_FAILS = 5                                    # неверных попыток подряд
+PW_BLOCK_MIN = 10                                   # блокировка на столько минут
+_pw_fails: dict[int, list[datetime]] = {}
+
+
+def has_room_access(user_id: int) -> bool:
+    if ADMIN_ID and user_id == ADMIN_ID:
+        return True
+    row = db.execute("SELECT room_ok FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return bool(row and row["room_ok"])
+
+
+def normalize_pw(text: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]", "", text).upper()
+
+
+def fmt_pw(code: str) -> str:
+    return f"{code[:4]}-{code[4:]}"
+
+
+def create_password() -> str:
+    while True:
+        code = "".join(secrets.choice(PW_ALPHABET) for _ in range(8))
+        if not db.execute("SELECT 1 FROM passwords WHERE code = ?", (code,)).fetchone():
+            db.execute("INSERT INTO passwords (code, created_at) VALUES (?, ?)", (code, datetime.now().isoformat()))
+            db.commit()
+            return code
+
+
+async def try_password(message: Message, bot: Bot, text: str) -> None:
+    """Человек вводит пароль для входа в «Секретную комнату»."""
+    uid = message.from_user.id
+    now = datetime.now()
+    recent = [t for t in _pw_fails.get(uid, []) if now - t < timedelta(minutes=PW_BLOCK_MIN)]
+    if len(recent) >= PW_MAX_FAILS:
+        await message.answer(f"Слишком много неверных попыток. Попробуй через {PW_BLOCK_MIN} минут.")
+        return
+    code = normalize_pw(text)
+    row = db.execute("SELECT used_by FROM passwords WHERE code = ?", (code,)).fetchone() if code else None
+    if not row or row["used_by"] is not None:
+        recent.append(now)
+        _pw_fails[uid] = recent
+        await message.answer("Пароль не подошёл. Он одноразовый: проверь, что ввёл его верно.")
+        return
+    db.execute("UPDATE passwords SET used_by = ?, used_at = ? WHERE code = ? AND used_by IS NULL",
+               (uid, now.isoformat(), code))
+    db.execute("UPDATE users SET room_ok = 1 WHERE user_id = ?", (uid,))
+    db.commit()
+    _pw_fails.pop(uid, None)
+    try:
+        await message.delete()  # чтобы пароль не оставался в переписке
+    except (TelegramBadRequest, TelegramForbiddenError):
+        pass
+    await message.answer("✅ Добро пожаловать в секретную комнату.\n\n" + WELCOME_CHAT)
+
+
+@dp.message(Command("newpass"), F.from_user.id == ADMIN_ID)
+async def cmd_newpass(message: Message):
+    """Создать одноразовый пароль для «Секретной комнаты»."""
+    code = create_password()
+    await message.answer(
+        "🔑 Новый пароль для секретной комнаты (одноразовый, на одного человека):\n\n"
+        f"<code>{fmt_pw(code)}</code>\n\n"
+        "Нажми на пароль, чтобы скопировать, и отправь его человеку.",
+        parse_mode="HTML",
+    )
+
+
+@dp.message(Command("passwords"), F.from_user.id == ADMIN_ID)
+async def cmd_passwords(message: Message):
+    """Неиспользованные пароли и счётчик использованных."""
+    free = db.execute("SELECT code FROM passwords WHERE used_by IS NULL ORDER BY created_at").fetchall()
+    used = db.execute("SELECT COUNT(*) FROM passwords WHERE used_by IS NOT NULL").fetchone()[0]
+    if free:
+        listing = "\n".join(f"<code>{fmt_pw(r['code'])}</code>" for r in free)
+        text = f"🔑 Неиспользованные пароли ({len(free)}):\n{listing}\n\nУже использовано: {used}"
+    else:
+        text = f"Неиспользованных паролей нет. Использовано: {used}\nСоздать новый: /newpass"
+    await message.answer(text, parse_mode="HTML")
+
+
 @dp.message(Command("thought"), F.from_user.id == ADMIN_ID)
 async def cmd_thought(message: Message, bot: Bot):
     """Мысль целиком и все диалоги под ней: /thought 12"""
@@ -1329,6 +1433,7 @@ async def cmd_admin_help(message: Message):
         "/thought <номер>: мысль и все диалоги под ней\n"
         "/del <номер>, /ban <id>, /unban <id>\n"
         "/names, /addname, /delname: имена\n"
+        "/newpass: создать одноразовый пароль для секретной комнаты, /passwords: список\n"
         "/stats, /version"
     )
 
@@ -1411,11 +1516,11 @@ async def process_thought(message: Message, bot: Bot, text: str, photo_id: str |
 async def forward_to_founder(message: Message, bot: Bot, text: str, photo_id: str | None = None) -> None:
     """«Секретный чат»: сообщение уходит основателю (ADMIN_ID) без имени и юзернейма, только «Аноним №»."""
     if not ADMIN_ID:
-        await message.answer("Секретный чат пока недоступен.")
+        await message.answer("Секретная комната пока недоступна.")
         return
     u = message.from_user
     num = zlib.crc32(f"{BOT_TOKEN}{u.id}".encode()) % 100000
-    head = f"🔒 Секретный чат · Аноним №{num}\nОтветить: reply на это сообщение. Забанить: reply с текстом /ban"
+    head = f"🔒 Секретная комната · Аноним №{num}\nОтветить: reply на это сообщение. Забанить: reply с текстом /ban"
     try:
         if photo_id:
             sent = await bot.send_photo(ADMIN_ID, photo_id, caption=(head + (f"\n\n{text}" if text else ""))[:1024])
@@ -1473,7 +1578,7 @@ async def on_secret_open(cb: CallbackQuery):
     ensure_user(cb.from_user)
     set_section(cb.from_user.id, "secret")
     await cb.answer()
-    await cb.message.answer("🔒 Вы в секретном чате. Пишите, сообщение уйдёт основателю.", reply_markup=main_kb())
+    await cb.message.answer("🔒 Вы в секретной комнате. Пишите, сообщение уйдёт администратору.", reply_markup=main_kb())
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
@@ -1487,7 +1592,10 @@ async def on_text_gossip(message: Message, bot: Bot):
     section, active_thread = get_state(uid)
 
     if section == "secret":
-        await forward_to_founder(message, bot, text)
+        if not has_room_access(uid):
+            await try_password(message, bot, text)
+        else:
+            await forward_to_founder(message, bot, text)
         return
 
     # В «Высказаться» с открытым диалогом сообщение уходит собеседнику
@@ -1521,6 +1629,9 @@ async def on_photo_gossip(message: Message, bot: Bot):
     photo_id = message.photo[-1].file_id  # самый большой размер
     section, active_thread = get_state(message.from_user.id)
     if section == "secret":
+        if not has_room_access(message.from_user.id):
+            await message.answer("🔒 Сначала введи пароль текстом.")
+            return
         await forward_to_founder(message, bot, caption, photo_id)
         return
     if section == "vent" and active_thread:
