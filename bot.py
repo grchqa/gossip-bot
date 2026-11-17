@@ -1,15 +1,21 @@
 """
 Бот "Сплетница" для Telegram (aiogram 3).
 
-РАЗДЕЛ «СПЛЕТНИ» (по умолчанию, /main):
+Внизу экрана три кнопки: «Секрет», «Высказаться», «Секретный чат».
+
+РАЗДЕЛ «СЕКРЕТ» (/main):
   Пришли свою сплетню (текстом или фото), получи чужую. К каждой сплетне бот в конце дописывает
   «от Коли» (случайное имя из списка), например: «я сегодня был пьяный. от Коли».
   Под чужой сплетней кнопки «Согласен» / «Не согласен». 3 и больше «Не согласен» = сплетня удаляется у всех.
 
 РАЗДЕЛ «ВЫСКАЗАТЬСЯ» (/vent):
-  Человек анонимно пишет мысль (только текст), получает чью-то чужую мысль. Под мыслью кнопка «Ответить»:
-  ответ уходит автору анонимно, дальше они могут переписываться сколько угодно, оба остаются анонимными.
-  Любой участник может закрыть диалог кнопкой «Закрыть».
+  Человек анонимно пишет мысль (текст или фото), без лимита. Мысль приходит ВСЕМ участникам бота.
+  Под мыслью кнопка «Ответить»: ответ уходит автору анонимно, дальше они могут переписываться,
+  оба остаются анонимными. Отвечать может любой. Любой участник может закрыть диалог кнопкой «Закрыть».
+
+РАЗДЕЛ «СЕКРЕТНЫЙ ЧАТ» (/secret):
+  Личный чат с основателем (текст и фото). Основатель видит, кто пишет (ID и юзернейм).
+  Ответить человеку: ответом (reply) на его сообщение в боте.
 
 Команды админа (ADMIN_ID):
   (автоматически) копия каждой новой сплетни и каждой новой мысли: содержимое, автор, /del и /ban.
@@ -22,7 +28,7 @@
   /names           - список имён для игры; /addname Имя; /delname Имя
   /stats           - статистика
 
-Для всех: /vent, /main, /notify (вкл/выкл уведомления «появились новые сплетни»), /id.
+Для всех: /main, /vent, /secret, /notify (вкл/выкл уведомления о новых сплетнях и мыслях), /id.
 
 Переменные окружения:
   BOT_TOKEN  - токен от @BotFather (обязательно)
@@ -45,18 +51,25 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     Message,
-    ReplyKeyboardRemove,
+    ReplyKeyboardMarkup,
 )
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 DB_PATH = os.getenv("DB_PATH", "gossip.db")
 
-BOT_VERSION = "v7: сплетни с подписью «от Имени» + раздел «Высказаться» (раздела 18+ нет, нижних кнопок нет)"
+BOT_VERSION = "v8: нижние кнопки «Секрет» / «Высказаться» / «Секретный чат» (раздела 18+ нет)"
+
+BTN_SECRET = "🤫 Секрет"
+BTN_VENT = "💭 Высказаться"
+BTN_CHAT = "🔒 Секретный чат"
+# Кнопки старых версий бота: если у человека осталась старая клавиатура, заменяем её новой
+OLD_BUTTONS = {"💬 Обычные сплетни", "🔥 Грязные сплетни", "🎲 Случайная грязная сплетня"}
 
 MIN_LEN = 5                  # минимальная длина сплетни
-MIN_LEN_VENT = 3             # минимальная длина мысли в «Высказаться»
+MIN_LEN_VENT = 1             # в «Высказаться» можно писать что угодно
 MAX_LEN = 4000               # максимальная длина текста (лимит Телеграма 4096, остаётся запас под заголовок и «от Имени»)
 MAX_CAPTION = 950            # максимальная длина подписи к фото (лимит Телеграма 1024, нужен запас под «от Имени»)
 DAILY_LIMIT = 10000          # лимит сплетен/мыслей в сутки на человека (10000 = практически без ограничений)
@@ -128,6 +141,10 @@ db.executescript(
     CREATE TABLE IF NOT EXISTS names (
         name TEXT PRIMARY KEY,
         gen TEXT
+    );
+    CREATE TABLE IF NOT EXISTS secret_map (
+        admin_msg_id INTEGER PRIMARY KEY,
+        user_id INTEGER
     );
     CREATE TABLE IF NOT EXISTS threads (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -313,6 +330,24 @@ def relay_keyboard(thread_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def main_kb() -> ReplyKeyboardMarkup:
+    """Постоянные кнопки внизу экрана."""
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_SECRET), KeyboardButton(text=BTN_VENT)],
+            [KeyboardButton(text=BTN_CHAT)],
+        ],
+        resize_keyboard=True,
+        is_persistent=True,
+    )
+
+
+def founder_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✉️ Написать ещё", callback_data="s:open")]]
+    )
+
+
 # --------------------------------------------------------------------------
 # Отправка и удаление сплетен
 # --------------------------------------------------------------------------
@@ -355,6 +390,26 @@ async def deliver_to_pending(bot: Bot, gossip_id: int, text: str, photo_id: str 
         db.commit()
         if ok:
             return
+
+
+async def broadcast_thought(bot: Bot, gossip_id: int, text: str, photo_id: str | None, author_id: int) -> None:
+    """Мысль из «Высказаться» уходит всем участникам бота (кроме автора, забаненных и отключивших уведомления)."""
+    try:
+        rows = db.execute(
+            "SELECT user_id FROM users WHERE banned = 0 AND notify = 1 AND user_id != ?", (author_id,)
+        ).fetchall()
+        for row in rows:
+            try:
+                await send_gossip(bot, row["user_id"], gossip_id, text, photo_id)
+            except TelegramRetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+                try:
+                    await send_gossip(bot, row["user_id"], gossip_id, text, photo_id)
+                except Exception:
+                    pass
+            await asyncio.sleep(0.05)  # не превышаем лимит Telegram
+    except Exception:
+        logging.exception("Ошибка рассылки мысли")
 
 
 async def remove_gossip(bot: Bot, gossip_id: int) -> None:
@@ -545,7 +600,7 @@ def close_thread(thread_id: int) -> None:
     db.commit()
 
 
-async def relay_message(message: Message, bot: Bot, text: str, thread_id: int) -> None:
+async def relay_message(message: Message, bot: Bot, text: str, thread_id: int, photo_id: str | None = None) -> None:
     """Пересылает сообщение собеседнику по диалогу, не раскрывая отправителя."""
     uid = message.from_user.id
     th = get_thread(thread_id)
@@ -571,9 +626,13 @@ async def relay_message(message: Message, bot: Bot, text: str, thread_id: int) -
         g = db.execute("SELECT text FROM gossips WHERE id = ?", (th["gossip_id"],)).fetchone()
         snippet = (g["text"] or "") if g else ""
         snippet = snippet[:120] + ("…" if len(snippet) > 120 else "")
-        header += f"\nОтвет на вашу мысль: «{snippet}»"
+        header += f"\nОтвет на вашу мысль: «{snippet or 'фото'}»"
     try:
-        await bot.send_message(other, f"{header}\n\n{text}", reply_markup=relay_keyboard(thread_id))
+        if photo_id:
+            caption = (header + (f"\n\n{text}" if text else ""))[:1024]
+            await bot.send_photo(other, photo_id, caption=caption, reply_markup=relay_keyboard(thread_id))
+        else:
+            await bot.send_message(other, f"{header}\n\n{text}", reply_markup=relay_keyboard(thread_id))
     except (TelegramForbiddenError, TelegramBadRequest):
         close_thread(thread_id)
         await message.answer("Не удалось доставить: собеседник недоступен. Диалог закрыт.")
@@ -588,10 +647,40 @@ async def relay_message(message: Message, bot: Bot, text: str, thread_id: int) -
 dp = Dispatcher()
 
 MENU_COMMANDS = [
-    BotCommand(command="main", description="Сплетни"),
+    BotCommand(command="main", description="Секрет"),
     BotCommand(command="vent", description="Высказаться"),
+    BotCommand(command="secret", description="Секретный чат"),
     BotCommand(command="notify", description="Уведомления вкл/выкл"),
 ]
+
+WELCOME_MAIN = (
+    "🤫 Секрет\n\n"
+    "Пришли мне сплетню (текстом или фото), и я сразу дам тебе чужую. Сначала ты, потом тебе.\n"
+    "Всё анонимно. В конце сплетни я дописываю случайное имя из списка, оно выбрано наугад и ничего не значит.\n"
+    "Под чужой сплетней можно нажать «Согласен» или «Не согласен»: если трое не согласны, сплетня удаляется.\n\n"
+    "Просто отправь свою сплетню следующим сообщением 👇"
+)
+WELCOME_VENT = (
+    "💭 Высказаться\n\n"
+    "Напиши мысль или отправь фото, всё анонимно и без лимита. Твоя мысль придёт всем участникам бота, "
+    "а любой из них сможет ответить тебе анонимно: поддержать или поговорить.\n\n"
+    "Просто напиши следующим сообщением 👇"
+)
+WELCOME_CHAT = (
+    "🔒 Секретный чат\n\n"
+    "Это личный чат с основателем бота, без цензуры: можно высказаться, пожаловаться или просто поделиться "
+    "чем-то, текстом или фото. Другим участникам это не показывается.\n"
+    "Важно: основатель видит, кто пишет (ваш ID и юзернейм).\n\n"
+    "Пишите следующим сообщением 👇"
+)
+
+
+async def enter_section(message: Message, section: str, text: str) -> None:
+    ensure_user(message.from_user)
+    if is_banned(message.from_user.id):
+        return
+    set_section(message.from_user.id, section)
+    await message.answer(text, reply_markup=main_kb())
 
 
 @dp.message(CommandStart())
@@ -599,45 +688,43 @@ async def cmd_start(message: Message):
     ensure_user(message.from_user)
     if is_banned(message.from_user.id):
         return
+    set_section(message.from_user.id, "main")
     await message.answer(
         "🤫 Привет! Я Сплетница.\n\n"
-        "Напиши мне сплетню (текстом или фото), и я сразу дам тебе чужую. Сначала ты, потом тебе.\n"
-        "Всё анонимно. В конце сплетни я дописываю случайное имя из списка, "
-        "оно выбрано наугад и ничего не значит.\n"
-        "Под чужой сплетней можно нажать «Согласен» или «Не согласен»: "
-        "если трое не согласны, сплетня удаляется.\n\n"
-        "💭 Хочешь просто выговориться? Команда /vent: анонимно поделись мыслью, "
-        "а другие смогут ответить, поддержать или поговорить с тобой.\n\n"
-        "Просто отправь свою сплетню следующим сообщением 👇",
-        reply_markup=ReplyKeyboardRemove(),
+        "Внизу три кнопки:\n"
+        "• «Секрет»: обменивайся сплетнями анонимно\n"
+        "• «Высказаться»: поделись мыслью, а другие смогут поддержать тебя\n"
+        "• «Секретный чат»: личный чат с основателем бота\n\n"
+        + WELCOME_MAIN,
+        reply_markup=main_kb(),
     )
 
 
 @dp.message(Command("vent"))
+@dp.message(F.text == BTN_VENT)
 async def cmd_vent(message: Message):
-    ensure_user(message.from_user)
-    if is_banned(message.from_user.id):
-        return
-    set_section(message.from_user.id, "vent")
-    await message.answer(
-        "💭 Высказаться\n\n"
-        "Напишите свою мысль (только текст), всё анонимно. Я сразу пришлю вам чью-то чужую мысль, "
-        "а на вашу смогут ответить другие: поддержать или продолжить разговор прямо в боте.\n\n"
-        "К сплетням: /main",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    await enter_section(message, "vent", WELCOME_VENT)
 
 
 @dp.message(Command("main"))
+@dp.message(F.text == BTN_SECRET)
 async def cmd_main(message: Message):
+    await enter_section(message, "main", WELCOME_MAIN)
+
+
+@dp.message(Command("secret"))
+@dp.message(F.text == BTN_CHAT)
+async def cmd_secret(message: Message):
+    await enter_section(message, "secret", WELCOME_CHAT)
+
+
+@dp.message(F.text.in_(OLD_BUTTONS))
+async def on_old_keyboard(message: Message):
+    """У человека осталась клавиатура старой версии: заменяем её на новую."""
     ensure_user(message.from_user)
     if is_banned(message.from_user.id):
         return
-    set_section(message.from_user.id, "main")
-    await message.answer(
-        "🤫 Вы в разделе сплетен. Пришлите сплетню текстом или фото.\nВысказаться: /vent",
-        reply_markup=ReplyKeyboardRemove(),
-    )
+    await message.answer("Кнопки обновились 👇 Выбери раздел внизу.", reply_markup=main_kb())
 
 
 @dp.message(Command("ban"))
@@ -856,11 +943,11 @@ async def cmd_notify(message: Message):
     if row["notify"]:
         db.execute("UPDATE users SET notify = 0 WHERE user_id = ?", (message.from_user.id,))
         db.commit()
-        await message.answer("🔕 Уведомления о новых сплетнях выключены. Включить: /notify")
+        await message.answer("🔕 Уведомления о новых сплетнях и мыслях выключены. Включить: /notify")
     else:
         db.execute("UPDATE users SET notify = 1 WHERE user_id = ?", (message.from_user.id,))
         db.commit()
-        await message.answer("🔔 Уведомления о новых сплетнях включены.")
+        await message.answer("🔔 Уведомления о новых сплетнях и мыслях включены.")
 
 
 @dp.message(Command("version"))
@@ -878,6 +965,9 @@ async def process_gossip(message: Message, bot: Bot, text: str, photo_id: str | 
     """Общая часть для сплетни и мысли: сохранить, отдать ждущему, выдать автору чужую."""
     user_id = message.from_user.id
     section = get_section(user_id)
+    if section == "vent":
+        await process_thought(message, bot, text, photo_id)
+        return
     if posts_today(user_id) >= DAILY_LIMIT:
         await message.answer("На сегодня лимит исчерпан, возвращайся завтра 🌙")
         return
@@ -908,13 +998,102 @@ async def process_gossip(message: Message, bot: Bot, text: str, photo_id: str | 
             (user_id, datetime.now().isoformat(), section),
         )
         db.commit()
-        what = "мысль" if section == "vent" else "сплетня"
         await message.answer(
-            f"Твоя {what} принята ✅ Пока чужих нет, "
+            "Твоя сплетня принята ✅ Пока чужих нет, "
             "но как только появится новая, я пришлю её тебе."
         )
 
     await maybe_broadcast(bot)
+
+
+async def process_thought(message: Message, bot: Bot, text: str, photo_id: str | None = None) -> None:
+    """«Высказаться»: мысль без лимита уходит всем участникам бота."""
+    user_id = message.from_user.id
+    cur = db.execute(
+        "INSERT INTO gossips (author_id, text, photo_id, created_at, section, name) VALUES (?, ?, ?, ?, 'vent', NULL)",
+        (user_id, text, photo_id, datetime.now().isoformat()),
+    )
+    gossip_id = cur.lastrowid
+    db.commit()
+
+    await notify_admin_new_gossip(bot, gossip_id, message.from_user, text, photo_id, "vent", None)
+
+    task = asyncio.create_task(broadcast_thought(bot, gossip_id, text, photo_id, user_id))
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+    await message.answer(
+        "💭 Твоя мысль отправлена всем участникам ✅\n"
+        "Если кто-то захочет поддержать, ответ придёт сюда анонимно."
+    )
+
+
+async def forward_to_founder(message: Message, bot: Bot, text: str, photo_id: str | None = None) -> None:
+    """«Секретный чат»: сообщение уходит основателю (ADMIN_ID), он видит ID и юзернейм."""
+    if not ADMIN_ID:
+        await message.answer("Секретный чат пока недоступен.")
+        return
+    u = message.from_user
+    uname = f"@{u.username}" if u.username else "без юзернейма"
+    head = f"🔒 Секретный чат · {u.id} ({uname})\nОтветить: reply на это сообщение"
+    try:
+        if photo_id:
+            sent = await bot.send_photo(ADMIN_ID, photo_id, caption=(head + (f"\n\n{text}" if text else ""))[:1024])
+        else:
+            sent = await bot.send_message(ADMIN_ID, f"{head}\n\n{text}"[:4096])
+    except (TelegramForbiddenError, TelegramBadRequest):
+        await message.answer("Не удалось доставить, попробуй позже.")
+        return
+    db.execute("INSERT OR REPLACE INTO secret_map (admin_msg_id, user_id) VALUES (?, ?)", (sent.message_id, u.id))
+    db.commit()
+    await message.answer("✅ Доставлено основателю. Ответ придёт сюда.")
+
+
+def is_founder_reply(message: Message) -> bool:
+    """Основатель отвечает (reply) на сообщение из секретного чата."""
+    if not ADMIN_ID or not message.from_user or message.from_user.id != ADMIN_ID or not message.reply_to_message:
+        return False
+    if (message.text or "").startswith("/"):
+        return False
+    return db.execute(
+        "SELECT 1 FROM secret_map WHERE admin_msg_id = ?", (message.reply_to_message.message_id,)
+    ).fetchone() is not None
+
+
+@dp.message(is_founder_reply)
+async def on_founder_reply(message: Message, bot: Bot):
+    row = db.execute(
+        "SELECT user_id FROM secret_map WHERE admin_msg_id = ?", (message.reply_to_message.message_id,)
+    ).fetchone()
+    body = (message.text or message.caption or "").strip()
+    head = "🔒 Основатель:"
+    try:
+        if message.photo:
+            await bot.send_photo(
+                row["user_id"], message.photo[-1].file_id,
+                caption=(head + (f"\n\n{body}" if body else ""))[:1024], reply_markup=founder_keyboard(),
+            )
+        elif body:
+            await bot.send_message(row["user_id"], f"{head}\n\n{body}", reply_markup=founder_keyboard())
+        else:
+            await message.answer("Поддерживаются текст и фото.")
+            return
+    except (TelegramForbiddenError, TelegramBadRequest):
+        await message.answer("Не доставлено: человек заблокировал бота.")
+        return
+    await message.answer("✅ Отправлено.")
+
+
+@dp.callback_query(F.data == "s:open")
+async def on_secret_open(cb: CallbackQuery):
+    """Кнопка «Написать ещё» под ответом основателя."""
+    if is_banned(cb.from_user.id):
+        await cb.answer()
+        return
+    ensure_user(cb.from_user)
+    set_section(cb.from_user.id, "secret")
+    await cb.answer()
+    await cb.message.answer("🔒 Вы в секретном чате. Пишите, сообщение уйдёт основателю.", reply_markup=main_kb())
 
 
 @dp.message(F.text & ~F.text.startswith("/"))
@@ -926,6 +1105,10 @@ async def on_text_gossip(message: Message, bot: Bot):
 
     text = message.text.strip()
     section, active_thread = get_state(uid)
+
+    if section == "secret":
+        await forward_to_founder(message, bot, text)
+        return
 
     # В «Высказаться» с открытым диалогом сообщение уходит собеседнику
     if section == "vent" and active_thread:
@@ -951,14 +1134,18 @@ async def on_photo_gossip(message: Message, bot: Bot):
     ensure_user(message.from_user)
     if is_banned(message.from_user.id):
         return
-    if get_section(message.from_user.id) == "vent":
-        await message.answer("В «Высказаться» только текст. К сплетням: /main")
-        return
     caption = (message.caption or "").strip()
     if len(caption) > MAX_CAPTION:
         await message.answer(f"Подпись слишком длинная, уложись в {MAX_CAPTION} символов.")
         return
     photo_id = message.photo[-1].file_id  # самый большой размер
+    section, active_thread = get_state(message.from_user.id)
+    if section == "secret":
+        await forward_to_founder(message, bot, caption, photo_id)
+        return
+    if section == "vent" and active_thread:
+        await relay_message(message, bot, caption, active_thread, photo_id)
+        return
     await process_gossip(message, bot, caption, photo_id)
 
 
