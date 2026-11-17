@@ -2,8 +2,8 @@
 Бот "Сплетница" для Telegram (aiogram 3).
 
 РАЗДЕЛ «СПЛЕТНИ» (по умолчанию, /main):
-  Пришли свою сплетню (текстом или фото), получи чужую. К каждой сплетне бот сам подставляет
-  СЛУЧАЙНОЕ имя из списка (игра, к реальности отношения не имеет, под сплетней это написано).
+  Пришли свою сплетню (текстом или фото), получи чужую. К каждой сплетне бот в конце дописывает
+  «от Коли» (случайное имя из списка), например: «я сегодня был пьяный. от Коли».
   Под чужой сплетней кнопки «Согласен» / «Не согласен». 3 и больше «Не согласен» = сплетня удаляется у всех.
 
 РАЗДЕЛ «ВЫСКАЗАТЬСЯ» (/vent):
@@ -52,10 +52,12 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 DB_PATH = os.getenv("DB_PATH", "gossip.db")
 
+BOT_VERSION = "v6: сплетни с подписью «от Имени» + раздел «Высказаться» (раздела 18+ нет)"
+
 MIN_LEN = 5                  # минимальная длина сплетни
 MIN_LEN_VENT = 3             # минимальная длина мысли в «Высказаться»
-MAX_LEN = 3800               # максимальная длина текста (с запасом под имя и заголовок, лимит Телеграма 4096)
-MAX_CAPTION = 850            # максимальная длина подписи к фото (лимит Телеграма 1024, нужен запас под имя)
+MAX_LEN = 4000               # максимальная длина текста (лимит Телеграма 4096, остаётся запас под заголовок и «от Имени»)
+MAX_CAPTION = 950            # максимальная длина подписи к фото (лимит Телеграма 1024, нужен запас под «от Имени»)
 DAILY_LIMIT = 10000          # лимит сплетен/мыслей в сутки на человека (10000 = практически без ограничений)
 DISLIKE_LIMIT = 3            # сколько «Не согласен» нужно, чтобы сплетня удалилась
 BROADCAST_EVERY = 5          # после скольких новых сплетен оповещать всех пользователей
@@ -123,7 +125,8 @@ db.executescript(
         section TEXT DEFAULT 'main'
     );
     CREATE TABLE IF NOT EXISTS names (
-        name TEXT PRIMARY KEY
+        name TEXT PRIMARY KEY,
+        gen TEXT
     );
     CREATE TABLE IF NOT EXISTS threads (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -147,6 +150,7 @@ for _table, _col, _ddl in [
     ("gossips", "section", "TEXT DEFAULT 'main'"),
     ("gossips", "name", "TEXT"),
     ("pending", "section", "TEXT DEFAULT 'main'"),
+    ("names", "gen", "TEXT"),
 ]:
     _cols = {r["name"] for r in db.execute(f"PRAGMA table_info({_table})")}
     if _col not in _cols:
@@ -231,10 +235,40 @@ def random_name() -> str | None:
     return random.choice(names) if names else None
 
 
-def name_suffix(name: str | None) -> str:
+def _decline_word(w: str) -> str:
+    """Родительный падеж для одного имени: Коля -> Коли, Маша -> Маши, Дима -> Димы, Иван -> Ивана."""
+    low = w.lower()
+    if low.endswith("я"):
+        return w[:-1] + "и"
+    if low.endswith("а"):
+        return w[:-1] + ("и" if len(w) > 1 and w[-2].lower() in "гжкхчшщ" else "ы")
+    if low.endswith(("й", "ь")):
+        return w[:-1] + "я"
+    if low[-1] in "бвгджзклмнпрстфхцчшщ":
+        return w + "а"
+    return w  # несклоняемые имена оставляем как есть
+
+
+def name_genitive(name: str) -> str:
+    """Форма «от кого». Можно задать вручную: /addname Лёша=Лёши. Иначе склоняем первое слово имени."""
+    row = db.execute("SELECT gen FROM names WHERE name = ?", (name,)).fetchone()
+    if row and row["gen"]:
+        return row["gen"]
+    parts = name.split(" ")
+    return " ".join([_decline_word(parts[0])] + parts[1:])
+
+
+def with_name(text: str | None, name: str | None) -> str:
+    """Дописывает в конец сплетни подпись: «я сегодня был пьяный. от Коли»."""
+    text = (text or "").rstrip()
     if not name:
-        return ""
-    return f"\n\n🎲 Бот решил, что это про: {name}\n(имя выбрано случайно, это игра)"
+        return text
+    sender = f"от {name_genitive(name)}"
+    if not text:
+        return sender
+    if text[-1] not in ".!?…":
+        text += "."
+    return f"{text} {sender}"
 
 
 # --------------------------------------------------------------------------
@@ -285,16 +319,16 @@ async def send_gossip(bot: Bot, user_id: int, gossip_id: int, text: str, photo_i
     """Отправляет сплетню или мысль. False, если пользователь заблокировал бота."""
     srow = db.execute("SELECT section, name FROM gossips WHERE id = ?", (gossip_id,)).fetchone()
     if srow and srow["section"] == "vent":
-        kb, title, suffix = thought_keyboard(gossip_id), "💭 Чья-то мысль", ""
+        kb, title, shown = thought_keyboard(gossip_id), "💭 Чья-то мысль", text
     else:
         kb, title = vote_keyboard(gossip_id), "🤫 Чужая сплетня"
-        suffix = name_suffix(srow["name"] if srow else None)
+        shown = with_name(text, srow["name"] if srow else None)
     try:
         if photo_id:
-            caption = title + (f":\n\n{text}" if text else "") + suffix
+            caption = title + (f":\n\n{shown}" if shown else "")
             sent = await bot.send_photo(user_id, photo_id, caption=caption, reply_markup=kb)
         else:
-            sent = await bot.send_message(user_id, f"{title}:\n\n{text}{suffix}", reply_markup=kb)
+            sent = await bot.send_message(user_id, f"{title}:\n\n{shown}", reply_markup=kb)
     except (TelegramForbiddenError, TelegramBadRequest):
         return False
     db.execute("INSERT OR IGNORE INTO seen (user_id, gossip_id) VALUES (?, ?)", (user_id, gossip_id))
@@ -370,13 +404,13 @@ async def notify_admin_new_gossip(bot: Bot, gossip_id: int, user, text: str, pho
     if not ADMIN_ID or user.id == ADMIN_ID:
         return
     mark = "💭" if section == "vent" else "🤫"
-    name_line = f"\n\n🎲 {name}" if name else ""
+    shown = text if section == "vent" else with_name(text, name)
     try:
         if photo_id:
-            caption = f"{mark} №{gossip_id}" + (f"\n\n{text}" if text else "") + name_line
+            caption = f"{mark} №{gossip_id}" + (f"\n\n{shown}" if shown else "")
             sent = await bot.send_photo(ADMIN_ID, photo_id, caption=caption)
         else:
-            sent = await bot.send_message(ADMIN_ID, f"{mark} №{gossip_id}\n\n{text}{name_line}")
+            sent = await bot.send_message(ADMIN_ID, f"{mark} №{gossip_id}\n\n{shown}")
         uname = f"@{user.username}" if user.username else "без юзернейма"
         await bot.send_message(
             ADMIN_ID,
@@ -566,9 +600,10 @@ async def cmd_start(message: Message):
         return
     await message.answer(
         "🤫 Привет! Я Сплетница.\n\n"
-        "Напиши мне сплетню (текстом или фото), и я сразу дам тебе чужую. Сначала ты, потом тебе. "
-        "К каждой сплетне я сама подставляю случайное имя из списка: это игра.\n"
-        "Всё анонимно. Под чужой сплетней можно нажать «Согласен» или «Не согласен»: "
+        "Напиши мне сплетню (текстом или фото), и я сразу дам тебе чужую. Сначала ты, потом тебе.\n"
+        "Всё анонимно. В конце сплетни я дописываю случайное имя из списка, "
+        "оно выбрано наугад и ничего не значит.\n"
+        "Под чужой сплетней можно нажать «Согласен» или «Не согласен»: "
         "если трое не согласны, сплетня удаляется.\n\n"
         "💭 Хочешь просто выговориться? Команда /vent: анонимно поделись мыслью, "
         "а другие смогут ответить, поддержать или поговорить с тобой.\n\n"
@@ -650,8 +685,13 @@ async def cmd_names(message: Message):
     if not ADMIN_ID or message.from_user.id != ADMIN_ID:
         return
     names = get_names()
-    listing = ", ".join(names) if names else "(список пуст, имена к сплетням не подставляются)"
-    await message.answer(f"🎲 Имена для игры:\n{listing}\n\nДобавить: /addname Имя\nУбрать: /delname Имя")
+    listing = "\n".join(f"{n} → от {name_genitive(n)}" for n in names) if names else "(список пуст, имена не дописываются)"
+    await message.answer(
+        f"Имена к сплетням:\n{listing}\n\n"
+        "Добавить: /addname Имя (форму «от кого» подберу сама)\n"
+        "Если склонила неверно: /addname Лёша=Лёши\n"
+        "Убрать: /delname Имя"
+    )
 
 
 @dp.message(Command("addname"))
@@ -659,16 +699,18 @@ async def cmd_addname(message: Message):
     if not ADMIN_ID or message.from_user.id != ADMIN_ID:
         return
     parts = (message.text or "").split(maxsplit=1)
-    name = parts[1].strip() if len(parts) > 1 else ""
-    if not name or len(name) > 30:
-        await message.answer("Формат: /addname Имя (до 30 символов)")
+    raw = parts[1].strip() if len(parts) > 1 else ""
+    name, _, gen = raw.partition("=")
+    name, gen = name.strip(), gen.strip()
+    if not name or len(name) > 30 or len(gen) > 30:
+        await message.answer("Формат: /addname Имя или /addname Имя=Форма (до 30 символов)")
         return
     if any(n.casefold() == name.casefold() for n in get_names()):
         await message.answer(f"«{name}» уже есть в списке.")
         return
-    db.execute("INSERT INTO names (name) VALUES (?)", (name,))
+    db.execute("INSERT INTO names (name, gen) VALUES (?, ?)", (name, gen or None))
     db.commit()
-    await message.answer(f"Добавлено: {name}. Сейчас в списке: {len(get_names())}.")
+    await message.answer(f"Добавлено: {name} → от {name_genitive(name)}. Сейчас в списке: {len(get_names())}.")
 
 
 @dp.message(Command("delname"))
@@ -815,6 +857,12 @@ async def cmd_notify(message: Message):
         await message.answer("🔔 Уведомления о новых сплетнях включены.")
 
 
+@dp.message(Command("version"))
+async def cmd_version(message: Message):
+    """Показывает, какая версия бота реально запущена на хостинге."""
+    await message.answer(f"Версия бота: {BOT_VERSION}")
+
+
 @dp.message(Command("id"))
 async def cmd_id(message: Message):
     await message.answer(f"Ваш Telegram ID: {message.from_user.id}")
@@ -840,9 +888,6 @@ async def process_gossip(message: Message, bot: Bot, text: str, photo_id: str | 
 
     # Копия админу
     await notify_admin_new_gossip(bot, gossip_id, message.from_user, text, photo_id, section, name)
-
-    if name:
-        await message.answer(f"🎲 Бот решил, что твоя сплетня про: {name}")
 
     # Новую сплетню сразу отдаём тому, кто ждёт
     await deliver_to_pending(bot, gossip_id, text, photo_id, user_id, section)
@@ -1061,6 +1106,7 @@ async def main():
     if not BOT_TOKEN:
         raise SystemExit("Не задан BOT_TOKEN. Добавьте токен в переменные окружения.")
     logging.basicConfig(level=logging.INFO)
+    logging.info("Запуск, версия бота: %s", BOT_VERSION)
     bot = Bot(BOT_TOKEN)
     try:
         await bot.set_my_commands(MENU_COMMANDS)
